@@ -1,0 +1,26 @@
+{
+  "evaldeck_acceptance": {
+    "id": "evaldeck_acceptance-R8AMG622WJ",
+    "schema": "AGENTCORE_EVALUATION_PREDEFINED_V1",
+    "versions": [
+      {
+        "version": "2",
+        "sha256": "675a13837712cedb78bdd256de3d4908ddd8e979cc4bec8bfac6f2e856d93793",
+        "rows": 5,
+        "published_at": "2026-11-06T10:57:51.365209+00:00"
+      },
+      {
+        "version": "3",
+        "sha256": "b7a60f1fcdb2389278d44fff326dad482e80f5bd768faf99336e77216e7d0409",
+        "rows": 6,
+        "published_at": "2026-11-06T11:24:11.269271+00:00"
+      },
+      {
+        "version": "4",
+        "sha256": "423e0c6cabd0f61cbf6f33d782dec78dd8da7a23a55e8f2b9cafe2e425c0b31d",
+        "rows": 6,
+        "published_at": "2026-11-06T11:44:56.018800+00:00"
+      }
+    ]
+  }
+}

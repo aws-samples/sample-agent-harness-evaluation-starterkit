@@ -1,0 +1,15 @@
+# local environments and build outputs
+.venv/
+**/.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+**/cdk.out/
+agent/evaldeck/agentcore/.cache/
+# account-specific deploy state (re-created by `agentcore deploy` from your credentials)
+agent/evaldeck/agentcore/.cli/
+agent/evaldeck/agentcore/aws-targets.json
+agent/evaldeck/agentcore/.env.local
+# run outputs (results, reports, job dumps) - regenerate by running the scripts
+out/
+*.zip

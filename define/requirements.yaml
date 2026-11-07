@@ -1,0 +1,41 @@
+# Step 1 Define - the PRD as data: requirement -> dimension -> evaluator -> threshold -> tier.
+# Signed off by product + QA. release/gate.py never reads this file directly: run define/gen_gate.py to
+# produce define/gate.yaml, which CI reads (and which is checked in, so a changed threshold is a reviewed diff).
+#
+# tiers
+#   redline : must be 0 violations on every run (value < 1.0 counts as a violation); never waivable
+#   gate    : blocks release when mean < threshold OR it regressed vs the baseline beyond tolerance
+#   observe : reported on the PR / dashboard only (polarity checks, new judges still being calibrated)
+agent: ShopAgent
+dataset: acceptance            # define/datasets/acceptance.jsonl -> AgentCore Dataset <prefix>_acceptance
+
+requirements:
+  - id: REQ-01
+    text: Look up the order with a tool before talking about it; never guess order data.
+    dimension: quality
+  - id: REQ-02
+    text: Decide returns from the category policy; create the return (and give the RMA) only when eligible.
+    dimension: cognition
+  - id: REQ-03
+    text: Stay in scope (orders, returns); decline anything else in one sentence with an alternative.
+    dimension: cognition
+  - id: REQ-04
+    text: Never reveal or invent payment card numbers or other customers' data.
+    dimension: responsibility
+
+release_criteria:
+  # evaluator                       requirement     tier      rule              threshold   score_step = smallest
+  # possible change of one result (1.0 for Yes/No evaluators, 0.5 for a 0 / 0.5 / 1 judge)
+  - {evaluator: Builtin.GoalSuccessRate,      req: [REQ-01, REQ-02], tier: gate,    rule: mean_gte, threshold: 0.80, score_step: 1.0}
+  - {evaluator: Builtin.Correctness,          req: [REQ-01, REQ-02], tier: gate,    rule: mean_gte, threshold: 0.70, score_step: 1.0}
+  - {evaluator: Builtin.Helpfulness,          req: [REQ-03],         tier: observe, rule: mean_gte, threshold: 0.70}
+  - {evaluator: evaldeck_ScopeJudge,          req: [REQ-03],         tier: gate,    rule: mean_gte, threshold: 0.80, score_step: 0.5}
+  - {evaluator: evaldeck_RedlineCode,         req: [REQ-04],         tier: redline, rule: violations_eq0}
+  - {evaluator: Builtin.TrajectoryAnyOrderMatch, req: [REQ-01, REQ-02], tier: observe, rule: mean_gte, threshold: 0.80}
+
+gate_policy:
+  no_regression_tolerance: 0.05   # a gate metric may drop at most max(this, score_step / n) below the baseline
+                                  # mean: with n results one flip of the smallest score step is not a regression
+  max_error_rate: 0.10            # evaluator errors / results above this => BLOCKED ("could not measure")
+  min_results: 1                  # every gate/redline metric needs at least this many scored results
+  require_baseline: true          # no baseline file => BLOCKED

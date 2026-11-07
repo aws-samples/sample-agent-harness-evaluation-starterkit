@@ -1,0 +1,160 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Step 5 Observe - starter-kit alarms on AgentCore online evaluation results (score, red line, eval-silent).
+  Online evaluation publishes one metric per evaluator to the Bedrock-AgentCore/Evaluations namespace with the
+  dimensions {service.name, onlineEvaluationConfigId} (also {service.name} alone, which batch jobs write to as
+  well - so alarm on the pair to see live traffic only). Alarm names follow <prefix>-<agent>-<kind> so that
+  release/rollback_lambda.py can recognise them (redline / goal-score roll back; eval-silent only notifies).
+  Deploy: aws cloudformation deploy --stack-name evaldeck-alarms --template-file observe/alarms.yaml
+          --parameter-overrides ServiceName=<runtime-name>.PROD OnlineEvalConfigId=<config-id>
+          RuntimeArn=<arn> RuntimeMetricName=<runtime-name>::PROD
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: evaldeck
+    AllowedPattern: "[a-z0-9]+"
+  AgentName:
+    Type: String
+    Default: shopagent
+    AllowedPattern: "[a-z0-9]+"
+    Description: lower-case agent key used in alarm names (<prefix>-<agent>-<kind>)
+  ServiceName:
+    Type: String
+    Description: OTel service name of the evaluated endpoint, e.g. evaldeck_default_ShopAgent.PROD
+  OnlineEvalConfigId:
+    Type: String
+    Description: online evaluation config id (observe/online_eval.sh), e.g. evaldeck_online_DEFAULT-AbCdE12345
+  RuntimeArn:
+    Type: String
+    Description: runtime ARN (dimension Resource of the AWS/Bedrock-AgentCore Invocations metric)
+  RuntimeMetricName:
+    Type: String
+    Description: runtime endpoint as the Invocations metric names it, e.g. evaldeck_default_ShopAgent::PROD
+  EvaluationsNamespace:
+    Type: String
+    Default: Bedrock-AgentCore/Evaluations
+  RedlineMetric:
+    Type: String
+    Default: evaldeck_RedlineCode
+    Description: evaluator whose score must stay 1.0 (code red line); one metric per evaluator name
+  GoalMetric:
+    Type: String
+    Default: Builtin.GoalSuccessRate
+  GoalThreshold:
+    Type: Number
+    Default: 0.7
+    Description: hourly mean below this alarms; keep it under the gate threshold (judges drift online)
+  GoalMinSamples:
+    Type: Number
+    Default: 5
+    Description: below this many scored sessions per hour the score alarm stays quiet (small-sample noise)
+
+Resources:
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Prefix}-${AgentName}-alarms"
+      KmsMasterKeyId: alias/aws/sns
+      Tags: [{Key: project, Value: !Ref Prefix}]
+
+  # 1) red line: any online result below 1.0 in a 15-minute window. Missing data = no evidence of a breach,
+  #    which is why the eval-silent alarm below exists.
+  RedlineAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Prefix}-${AgentName}-redline"
+      AlarmDescription: !Sub "Red-line evaluator ${RedlineMetric} scored below 1.0 on ${ServiceName} (rollback candidate)"
+      Namespace: !Ref EvaluationsNamespace
+      MetricName: !Ref RedlineMetric
+      Dimensions: [{Name: service.name, Value: !Ref ServiceName}, {Name: onlineEvaluationConfigId, Value: !Ref OnlineEvalConfigId}]
+      Statistic: Minimum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions: [!Ref AlarmTopic]
+
+  # 2) quality score: hourly mean below the floor, only when there are enough samples to mean something
+  GoalScoreAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Prefix}-${AgentName}-goal-score"
+      AlarmDescription: !Sub "Hourly mean of ${GoalMetric} below ${GoalThreshold} with >= ${GoalMinSamples} samples"
+      EvaluationPeriods: 1
+      Threshold: !Ref GoalThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      Metrics:
+        - Id: avg
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref EvaluationsNamespace
+              MetricName: !Ref GoalMetric
+              Dimensions: [{Name: service.name, Value: !Ref ServiceName}, {Name: onlineEvaluationConfigId, Value: !Ref OnlineEvalConfigId}]
+            Period: 3600
+            Stat: Average
+        - Id: n
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref EvaluationsNamespace
+              MetricName: !Ref GoalMetric
+              Dimensions: [{Name: service.name, Value: !Ref ServiceName}, {Name: onlineEvaluationConfigId, Value: !Ref OnlineEvalConfigId}]
+            Period: 3600
+            Stat: SampleCount
+        - Id: score
+          Label: goal score when enough samples, else 1
+          Expression: !Sub "IF(FILL(n, 0) >= ${GoalMinSamples}, avg, 1)"
+          ReturnData: true
+
+  # 3) eval-silent: the agent had traffic but the red-line evaluator produced no results. "0 violations" can
+  #    mean "never judged" (evaluator error, throttling, a renamed or locked judge, a broken role). Notify only.
+  #    4 x 15 min windows, 3 breaching: online results arrive ~5-15 min after a session goes idle.
+  EvalSilentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${Prefix}-${AgentName}-eval-silent"
+      AlarmDescription: !Sub "Invocations on ${RuntimeMetricName} but no ${RedlineMetric} results (notify only, never roll back)"
+      EvaluationPeriods: 4
+      DatapointsToAlarm: 3
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      Metrics:
+        - Id: inv
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Bedrock-AgentCore
+              MetricName: Invocations
+              Dimensions:
+                - {Name: Resource, Value: !Ref RuntimeArn}
+                - {Name: Operation, Value: InvokeAgentRuntime}
+                - {Name: Name, Value: !Ref RuntimeMetricName}
+            Period: 900
+            Stat: Sum
+        - Id: judged
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Ref EvaluationsNamespace
+              MetricName: !Ref RedlineMetric
+              Dimensions: [{Name: service.name, Value: !Ref ServiceName}, {Name: onlineEvaluationConfigId, Value: !Ref OnlineEvalConfigId}]
+            Period: 900
+            Stat: SampleCount
+        - Id: silent
+          Label: red-line results when there was traffic (1 when idle)
+          Expression: "IF(FILL(inv, 0) > 0, FILL(judged, 0), 1)"
+          ReturnData: true
+
+Outputs:
+  AlarmTopicArn:
+    Value: !Ref AlarmTopic
+  AlarmNames:
+    Value: !Join [",", [!Ref RedlineAlarm, !Ref GoalScoreAlarm, !Ref EvalSilentAlarm]]

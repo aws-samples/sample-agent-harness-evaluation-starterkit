@@ -1,0 +1,31 @@
+# Step 4 Release - Release stage in AWS CodeBuild (after the Manual approval in release/ci/pipeline.yaml).
+# Inputs: the source (primary) + the Gate artifact (secondary GateOutput: staging.json, gate-report.json).
+# release.sh recomputes gate_key from staging.json, requires the PASS record in SSM, moves PROD, pins the bundle
+# on the Gateway and writes /<prefix>/release/current + previous. APPROVED_BY = who approved the Manual action.
+# Project env: PIPELINE_NAME, PIPELINE_EXECUTION_ID (#{codepipeline.PipelineExecutionId}), GATEWAY_ID,
+#              APPROVAL_ACTION (default Approve).
+version: 0.2
+env:
+  variables:
+    PYTHON: python3
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - cd starter-kit
+      - pip install -q boto3 pyyaml
+  build:
+    commands:
+      - mkdir -p out && cp "$CODEBUILD_SRC_DIR_GateOutput/staging.json" "$CODEBUILD_SRC_DIR_GateOutput/gate-report.json" out/
+      - >-
+        export APPROVED_BY=$(aws codepipeline list-action-executions --pipeline-name "$PIPELINE_NAME"
+        --filter "pipelineExecutionId=$PIPELINE_EXECUTION_ID"
+        --query "actionExecutionDetails[?actionName=='${APPROVAL_ACTION:-Approve}'] | [0].updatedBy" --output text)
+      - test -n "$APPROVED_BY" && test "$APPROVED_BY" != None
+      - echo "approved by $APPROVED_BY"
+      - bash release/release.sh
+artifacts:
+  base-directory: starter-kit/out
+  files:
+    - staging.json

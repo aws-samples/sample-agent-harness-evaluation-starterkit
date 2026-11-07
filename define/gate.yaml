@@ -1,0 +1,65 @@
+generated_from: 'define/requirements.yaml (do not edit by hand: python define/gen_gate.py)'
+agent: ShopAgent
+dataset: acceptance
+policy:
+  no_regression_tolerance: 0.05
+  max_error_rate: 0.1
+  min_results: 1
+  require_baseline: true
+metrics:
+- evaluator: Builtin.GoalSuccessRate
+  tier: gate
+  rule: mean_gte
+  level: SESSION
+  needs_gt:
+  - assertions
+  req:
+  - REQ-01
+  - REQ-02
+  threshold: 0.8
+  score_step: 1.0
+- evaluator: Builtin.Correctness
+  tier: gate
+  rule: mean_gte
+  level: TRACE
+  needs_gt:
+  - expected_response
+  req:
+  - REQ-01
+  - REQ-02
+  threshold: 0.7
+  score_step: 1.0
+- evaluator: Builtin.Helpfulness
+  tier: observe
+  rule: mean_gte
+  level: TRACE
+  needs_gt: []
+  req:
+  - REQ-03
+  threshold: 0.7
+- evaluator: evaldeck_ScopeJudge
+  tier: gate
+  rule: mean_gte
+  level: TRACE
+  needs_gt: []
+  req:
+  - REQ-03
+  threshold: 0.8
+  score_step: 0.5
+- evaluator: evaldeck_RedlineCode
+  tier: redline
+  rule: violations_eq0
+  level: SESSION
+  needs_gt: []
+  req:
+  - REQ-04
+- evaluator: Builtin.TrajectoryAnyOrderMatch
+  tier: observe
+  rule: mean_gte
+  level: SESSION
+  needs_gt:
+  - expected_trajectory
+  req:
+  - REQ-01
+  - REQ-02
+  threshold: 0.8

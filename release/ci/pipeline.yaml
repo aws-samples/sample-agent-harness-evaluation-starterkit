@@ -1,0 +1,450 @@
+# Step 4 Release - CodePipeline V2: Source -> DeployStaging -> Gate -> Approval (Manual) -> Release.
+#   Source         S3 object (a zip of the repo with starter-kit/ at its root) or CodeConnections (GitHub, GitLab, ...)
+#   DeployStaging  release/ci/buildspec-deploy.yml: deploy_staging.sh (agentcore deploy, STAGING -> new version,
+#                  PROD-unchanged check) -> staging.json. DeployRole: CDK deploy + STAGING only, PROD / DEFAULT denied
+#   Gate           release/ci/buildspec.yml: gate_step.sh (acceptance + sim on STAGING) -> record.py. GateRole cannot
+#                  deploy and cannot change any endpoint (explicit Deny); BLOCKED fails the build and stops the
+#                  execution; namespace GATE exports the decision + versions
+#   Approval  Manual, CustomData shows gate_key / runtime / bundle / dataset, link = gate report in the bucket
+#   Release   release/ci/buildspec-release.yml: release.sh (PASS record for the same gate_key, approver recorded)
+# ExecutionMode QUEUED serializes executions: one candidate on STAGING at a time (the deploy lock).
+# Roles are per stage (least privilege as validated in the reference run): only ReleaseRole can move PROD.
+# The CDK deploy itself runs as the CDK bootstrap execution role; release/protect_prod.sh adds a stack policy that
+# denies any template change to the PROD endpoint (run once). Production: STAGING and PROD in separate accounts.
+# Deploy:
+#   aws cloudformation deploy --stack-name evaldeck-pipeline --template-file release/ci/pipeline.yaml \
+#     --capabilities CAPABILITY_IAM --parameter-overrides AgentRuntimeArn=<arn> GatewayId=<id> \
+#     BundleId=<bundle-id> BundleVersion=<version-id>          # SourceType=CodeConnections ConnectionArn=... FullRepositoryId=org/repo
+#   (S3 source) cd <repo> && zip -r kit.zip starter-kit -x '*/.venv/*' '*/node_modules/*' '*/out/*' && \
+#     aws s3 cp kit.zip s3://<SourceBucket output>/evaldeck-kit.zip
+AWSTemplateFormatVersion: "2010-09-09"
+Description: evaldeck - agent evaluation gate and release pipeline (CodePipeline V2)
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: evaldeck
+    AllowedPattern: "^[a-z][a-z0-9]{1,20}$"
+  SourceType:
+    Type: String
+    Default: S3
+    AllowedValues: [S3, CodeConnections]
+  SourceObjectKey:
+    Type: String
+    Default: evaldeck-kit.zip
+  ConnectionArn:
+    Type: String
+    Default: ""
+    Description: CodeConnections connection ARN (SourceType=CodeConnections)
+  FullRepositoryId:
+    Type: String
+    Default: ""
+    Description: owner/repo (SourceType=CodeConnections)
+  BranchName:
+    Type: String
+    Default: main
+  AgentRuntimeArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[a-zA-Z0-9_-]+$"
+  GatewayId:
+    Type: String
+    Default: ""
+    Description: front-door Gateway id (release.sh pins the gated Config bundle there)
+  BundleId:
+    Type: String
+    Default: ""
+  BundleVersion:
+    Type: String
+    Default: ""
+  SkipDeploy:
+    Type: String
+    Default: "0"
+    AllowedValues: ["0", "1"]
+    Description: "1 = DeployStaging only re-points STAGING at the newest existing runtime version (no agentcore deploy)"
+Conditions:
+  UseS3: !Equals [!Ref SourceType, S3]
+  UseConnection: !Equals [!Ref SourceType, CodeConnections]
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-artifacts
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Condition: UseS3
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration: {Status: Enabled}          # required by the S3 source action
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+
+  # ---------------------------------------------------------------- DeployStaging: agentcore deploy + STAGING
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: deploy-staging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BuildLogsAndArtifacts
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${NamePrefix}-*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: CdkDeployViaBootstrapRoles          # agentcore deploy = CDK: deploy / publish / lookup roles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-*"
+              - Sid: AgentcoreCliReadsTheStacks          # project stack (+ deployed template for the pin sync) + CDKToolkit
+                Effect: Allow
+                Action: [cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:DescribeStackResources, cloudformation:GetTemplate]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/AgentCore-${NamePrefix}-*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*"
+              - Sid: AgentcoreCliTransactionSearchCheck
+                Effect: Allow
+                Action: [xray:GetTraceSegmentDestination, xray:GetIndexingRules, logs:DescribeResourcePolicies]
+                Resource: "*"
+              - Sid: ReadRuntimeAndEndpoints
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimeVersions
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/*"]
+              - Sid: MoveStagingOnly
+                Effect: Allow
+                Action: bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/STAGING"]
+              - Sid: BundleVersionForStagingRecord
+                Effect: Allow
+                Action: bedrock-agentcore:GetConfigurationBundleVersion
+                Resource: "*"
+              - Sid: NeverTouchProdOrDefault
+                Effect: Deny
+                Action:
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                  - bedrock-agentcore:DeleteAgentRuntimeEndpoint
+                Resource:
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/PROD"
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/DEFAULT"
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${NamePrefix}-deploy-staging"
+      ServiceRole: !GetAtt DeployRole.Arn
+      TimeoutInMinutes: 30
+      Source: {Type: CODEPIPELINE, BuildSpec: starter-kit/release/ci/buildspec-deploy.yml}
+      Artifacts: {Type: CODEPIPELINE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - {Name: AGENT_RUNTIME_ARN, Value: !Ref AgentRuntimeArn}
+          - {Name: BUNDLE_ID, Value: !Ref BundleId}
+          - {Name: BUNDLE_VERSION, Value: !Ref BundleVersion}
+          - {Name: NAME_PREFIX, Value: !Ref NamePrefix}
+          - {Name: SKIP_DEPLOY, Value: !Ref SkipDeploy}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+
+  # ---------------------------------------------------------------- Gate: evaluate STAGING + record (no deploy)
+  GateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: gate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BuildLogsAndArtifacts
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${NamePrefix}-*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: ReadAndInvokeRuntime                # invoke STAGING; read endpoints for the bundle check
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/*"]
+              - Sid: EvaluateDatasetsBundles
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:Evaluate
+                  - bedrock-agentcore:ListEvaluators
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:GetDataset
+                  - bedrock-agentcore:ListDatasetExamples
+                  - bedrock-agentcore:ListDatasetVersions
+                  - bedrock-agentcore:GetConfigurationBundleVersion
+                Resource: "*"
+              - Sid: SpansForEvaluation                  # SDK span collector + bundle_check (Logs Insights)
+                Effect: Allow
+                Action: [logs:StartQuery, logs:FilterLogEvents, logs:GetLogEvents]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+              - Effect: Allow
+                Action: [logs:GetQueryResults, logs:StopQuery]
+                Resource: "*"
+              - Sid: JudgesCustomDerivedAndSimulatedUser # caller credentials pay for these model calls
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: CodeEvaluatorLambda                 # CustomCode evaluator runs with the caller's credentials
+                Effect: Allow
+                Action: [lambda:InvokeFunction, lambda:GetFunction]
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}-*"
+              - Sid: GateRecord
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:AddTagsToResource, ssm:GetParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/gate/*"
+              - Sid: NoEndpointChangesNoDeploy
+                Effect: Deny
+                Action:
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                  - bedrock-agentcore:DeleteAgentRuntimeEndpoint
+                  - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                  - bedrock-agentcore:UpdateAgentRuntime
+                  - bedrock-agentcore:DeleteAgentRuntime
+                Resource: "*"
+              - Sid: NoCdkDeploy
+                Effect: Deny
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-*"
+  GateProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${NamePrefix}-gate"
+      ServiceRole: !GetAtt GateRole.Arn
+      TimeoutInMinutes: 60
+      Source: {Type: CODEPIPELINE, BuildSpec: starter-kit/release/ci/buildspec.yml}
+      Artifacts: {Type: CODEPIPELINE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - {Name: AGENT_RUNTIME_ARN, Value: !Ref AgentRuntimeArn}
+          - {Name: GATEWAY_ID, Value: !Ref GatewayId}
+          - {Name: BUNDLE_ID, Value: !Ref BundleId}
+          - {Name: BUNDLE_VERSION, Value: !Ref BundleVersion}
+          - {Name: NAME_PREFIX, Value: !Ref NamePrefix}
+          - {Name: REPORT_BUCKET, Value: !Ref ArtifactBucket}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+
+  # ---------------------------------------------------------------- Release: PROD + bundle pin + release records
+  ReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codebuild.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: release
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${NamePrefix}-*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: ReadGateRecordWriteReleaseRecord
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/*"
+              - Effect: Allow
+                Action: [ssm:PutParameter, ssm:AddTagsToResource]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
+              - Sid: MoveProdOnly
+                Effect: Allow
+                Action: [bedrock-agentcore:GetAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint]
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/PROD"]
+              - Sid: PinBundleOnGateway
+                Effect: Allow
+                Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:CreateGatewayRule, bedrock-agentcore:UpdateGatewayRule]
+                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+              - Sid: WhoApproved
+                Effect: Allow
+                Action: codepipeline:ListActionExecutions
+                Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${NamePrefix}-release"
+  ReleaseProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${NamePrefix}-release"
+      ServiceRole: !GetAtt ReleaseRole.Arn
+      TimeoutInMinutes: 20
+      Source: {Type: CODEPIPELINE, BuildSpec: starter-kit/release/ci/buildspec-release.yml}
+      Artifacts: {Type: CODEPIPELINE}
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - {Name: GATEWAY_ID, Value: !Ref GatewayId}
+          - {Name: NAME_PREFIX, Value: !Ref NamePrefix}
+          - {Name: PIPELINE_NAME, Value: !Sub "${NamePrefix}-release"}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+
+  # ---------------------------------------------------------------- pipeline
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: codepipeline.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject, s3:GetBucketVersioning, s3:GetBucketLocation, s3:ListBucket]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+                  - !If [UseS3, !GetAtt SourceBucket.Arn, !Ref AWS::NoValue]
+                  - !If [UseS3, !Sub "${SourceBucket.Arn}/*", !Ref AWS::NoValue]
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: [!GetAtt DeployProject.Arn, !GetAtt GateProject.Arn, !GetAtt ReleaseProject.Arn]
+              - !If
+                - UseConnection
+                - Effect: Allow
+                  Action: [codeconnections:UseConnection, codestar-connections:UseConnection]
+                  Resource:
+                    - !Sub "arn:${AWS::Partition}:codeconnections:${AWS::Region}:${AWS::AccountId}:connection/*"
+                    - !Sub "arn:${AWS::Partition}:codestar-connections:${AWS::Region}:${AWS::AccountId}:connection/*"
+                - !Ref AWS::NoValue
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${NamePrefix}-release"
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore: {Type: S3, Location: !Ref ArtifactBucket}
+      Stages:
+        - Name: Source
+          Actions:
+            - !If
+              - UseS3
+              - Name: Source
+                ActionTypeId: {Category: Source, Owner: AWS, Provider: S3, Version: "1"}
+                Configuration: {S3Bucket: !Ref SourceBucket, S3ObjectKey: !Ref SourceObjectKey, PollForSourceChanges: false}
+                OutputArtifacts: [{Name: SourceOutput}]
+                Namespace: SourceVariables
+              - Name: Source
+                ActionTypeId: {Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1"}
+                Configuration: {ConnectionArn: !Ref ConnectionArn, FullRepositoryId: !Ref FullRepositoryId, BranchName: !Ref BranchName}
+                OutputArtifacts: [{Name: SourceOutput}]
+                Namespace: SourceVariables
+        - Name: DeployStaging
+          Actions:
+            - Name: DeployStaging
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration: {ProjectName: !Ref DeployProject}
+              InputArtifacts: [{Name: SourceOutput}]
+              OutputArtifacts: [{Name: DeployOutput}]
+        - Name: Gate
+          Actions:
+            - Name: Gate
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration: {ProjectName: !Ref GateProject, PrimarySource: SourceOutput}
+              InputArtifacts: [{Name: SourceOutput}, {Name: DeployOutput}]
+              OutputArtifacts: [{Name: GateOutput}]
+              Namespace: GATE
+        - Name: Approval
+          Actions:
+            - Name: Approve
+              ActionTypeId: {Category: Approval, Owner: AWS, Provider: Manual, Version: "1"}
+              Configuration:
+                CustomData: "Gate #{GATE.GATE_DECISION} gate_key #{GATE.GATE_KEY}: runtime v#{GATE.RUNTIME_VERSION}, bundle #{GATE.BUNDLE_VERSION}, dataset v#{GATE.DATASET_VERSION}. Approve to move PROD."
+                ExternalEntityLink: !Sub "https://${AWS::Region}.console.aws.amazon.com/s3/object/${ArtifactBucket}?prefix=gates/#{GATE.GATE_KEY}/gate-report.json"
+        - Name: Release
+          Actions:
+            - Name: Release
+              ActionTypeId: {Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1"}
+              Configuration:
+                ProjectName: !Ref ReleaseProject
+                PrimarySource: SourceOutput
+                EnvironmentVariables: '[{"name":"PIPELINE_EXECUTION_ID","value":"#{codepipeline.PipelineExecutionId}","type":"PLAINTEXT"}]'
+              InputArtifacts: [{Name: SourceOutput}, {Name: GateOutput}]
+              OutputArtifacts: [{Name: ReleaseOutput}]
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  SourceBucket:
+    Condition: UseS3
+    Value: !Ref SourceBucket
+  ArtifactBucket:
+    Value: !Ref ArtifactBucket

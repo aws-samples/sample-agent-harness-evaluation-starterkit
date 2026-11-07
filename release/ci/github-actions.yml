@@ -1,0 +1,137 @@
+# Step 4 Release - GitHub Actions: PR gate on STAGING, release to PROD after human approval.
+# Copy to .github/workflows/agent-eval.yml (paths assume the kit lives in starter-kit/).
+#   pr       every PR + every push to main: deploy the candidate to STAGING with the deploy role, then switch to the
+#            gate role (no deploy, no endpoint changes) and run the gate (acceptance + sim segments, bundle version
+#            as baggage), record the decision in SSM, upload the report
+#   release  push to main only, after `pr` passed: `environment: production` (Settings -> Environments ->
+#            production -> Required reviewers = the human approval), then release.sh moves PROD
+# Repo settings: secrets AWS_DEPLOY_ROLE_ARN (STAGING deploy) + AWS_ROLE_ARN (gate) + AWS_RELEASE_ROLE_ARN (release),
+#                OIDC roles with the DeployRole / GateRole / ReleaseRole policies of pipeline.yaml, vars AWS_REGION,
+#                AGENT_RUNTIME_ARN, GATEWAY_ID, BUNDLE_ID, BUNDLE_VERSION (optional: the Config bundle to gate + ship).
+# One STAGING endpoint is shared, so the gate job is serialized (concurrency group, never cancelled mid-run).
+name: agent-eval
+on:
+  pull_request:
+    branches: [main]
+    paths: ["starter-kit/**"]
+  push:
+    branches: [main]
+    paths: ["starter-kit/**"]
+permissions:
+  id-token: write        # OIDC -> short-lived AWS credentials, no access keys in the repo
+  contents: read
+  pull-requests: write
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AGENT_RUNTIME_ARN: ${{ vars.AGENT_RUNTIME_ARN }}
+  GATEWAY_ID: ${{ vars.GATEWAY_ID }}
+  BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+  BUNDLE_VERSION: ${{ vars.BUNDLE_VERSION }}
+  AGENT_ENDPOINT: STAGING
+  GIT_COMMIT: ${{ github.sha }}
+  PYTHON: python
+jobs:
+  pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: evaldeck-staging            # deploy lock: one candidate on STAGING at a time
+      cancel-in-progress: false
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+      gate_key: ${{ steps.gate.outputs.gate_key }}
+    defaults:
+      run:
+        working-directory: starter-kit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Deploy role (CDK deploy + STAGING only; PROD / DEFAULT denied)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Install
+        run: |
+          pip install -r requirements.txt uv     # uv: agentcore packages the CodeZip runtime with it
+          npm i -g @aws/agentcore@1.0.1
+          (cd agent/evaldeck/agentcore/cdk && npm ci)
+      - name: Deploy candidate to STAGING
+        run: bash release/deploy_staging.sh
+      - name: Gate role (no deploy, no endpoint changes)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Gate on STAGING (acceptance + sim)
+        id: gate
+        run: |
+          set +e
+          bash release/ci/gate_step.sh
+          rc=$?
+          python -c "import json; r = json.load(open('out/gate-report.json')); print('decision=' + r['decision']); print('gate_key=' + r['gate_key'])" >> "$GITHUB_OUTPUT"
+          exit $rc
+      - name: Record decision (SSM)
+        if: always() && hashFiles('starter-kit/out/gate-report.json') != ''
+        run: python release/record.py
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-report
+          path: |
+            starter-kit/out/staging.json
+            starter-kit/out/gate-report.json
+            starter-kit/out/*.results.json
+      - name: Comment decision on the PR
+        if: always() && github.event_name == 'pull_request' && hashFiles('starter-kit/out/gate-report.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY' > comment.md
+          import json
+          r = json.load(open("out/gate-report.json"))
+          print(f"### Agent eval gate: **{r['decision']}**  (gate_key `{r['gate_key']}`, dataset v{(r.get('dataset') or {}).get('version')})")
+          print("| segment | metric | tier | mean | threshold | baseline | status |\n|---|---|---|---|---|---|---|")
+          for m in r["metrics"]:
+              print(f"| {m['segment']} | {m['metric']} | {m['tier']} | {m['mean']} | {m['threshold']} | {m['baseline']} | {m['status']} |")
+          for why in r["reasons"]:
+              print(f"- {why}")
+          PY
+          gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
+  release:
+    needs: pr
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.pr.outputs.decision == 'PASS'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production              # required reviewers = the human approval before PROD moves
+    concurrency:
+      group: evaldeck-prod
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: starter-kit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: gate-report
+          path: starter-kit/out
+      - name: Install
+        run: pip install -r requirements.txt
+      - name: Release to PROD (requires the PASS record for this gate_key)
+        env:
+          APPROVED_BY: "github environment production, run ${{ github.run_id }} (reviewer in the run log)"
+        run: bash release/release.sh

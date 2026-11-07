@@ -1,0 +1,17 @@
+{
+  "evaluatorName": "evaldeck_TaskCompletionOwnModel",
+  "description": "CustomDerived: ThirdParty.DeepEval.TaskCompletion logic, run on a model we choose (our account, our credentials)",
+  "level": "TRACE",
+  "evaluatorConfig": {
+    "derived": {
+      "baseEvaluatorId": "ThirdParty.DeepEval.TaskCompletion",
+      "modelConfig": {
+        "bedrockEvaluatorModelConfig": {
+          "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "inferenceConfig": {"maxTokens": 1024, "temperature": 0.0}
+        }
+      }
+    }
+  },
+  "tags": {"project": "evaldeck"}
+}

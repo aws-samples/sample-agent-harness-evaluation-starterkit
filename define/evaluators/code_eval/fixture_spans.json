@@ -1,0 +1,123 @@
+[
+ {
+  "scope": {
+   "name": "strands.telemetry.tracer",
+   "version": ""
+  },
+  "traceId": "6aedb1d93dc30c9225df1c7f63c57d05",
+  "spanId": "6cf4e6317f83403a",
+  "parentSpanId": "0be94f9bb5cc661f",
+  "flags": 256,
+  "name": "execute_tool get_order",
+  "kind": "INTERNAL",
+  "startTimeUnixNano": 1793962463667639126,
+  "endTimeUnixNano": 1793962463668175586,
+  "durationNano": 536460,
+  "attributes": {
+   "aws.local.service": "evaldeck_default_ShopAgent.DEFAULT",
+   "gen_ai.tool.status": "success",
+   "gen_ai.tool.call.id": "tooluse_ZzegBr1EDw7KkZt7bqW67t",
+   "gen_ai.tool.description": "Look up an order by its id (format ORD-1234). Returns item, category, status and days since delivery.",
+   "gen_ai.tool.json_schema": "{\"properties\": {\"order_id\": {\"description\": \"Parameter order_id\", \"type\": \"string\"}}, \"required\": [\"order_id\"], \"type\": \"object\"}",
+   "aws.genai.span_kind": "TOOL",
+   "gen_ai.event.start_time": "2026-11-06T10:54:23.667670+00:00",
+   "aws.local.environment": "bedrock-agentcore:default",
+   "gen_ai.provider.name": "strands-agents",
+   "gen_ai.operation.name": "execute_tool",
+   "gen_ai.event.end_time": "2026-11-06T10:54:23.668155+00:00",
+   "gen_ai.tool.name": "get_order",
+   "PlatformType": "AWS::BedrockAgentCore",
+   "session.id": "evaldeck-smoke-0000000000000000000000001",
+   "gen_ai.system": "strands-agents"
+  },
+  "events": [
+   {
+    "timeUnixNano": 1793962463667711588,
+    "name": "gen_ai.tool.message",
+    "attributes": {
+     "content": "{\"order_id\": \"ORD-1003\"}",
+     "role": "tool",
+     "id": "tooluse_ZzegBr1EDw7KkZt7bqW67t"
+    }
+   },
+   {
+    "timeUnixNano": 1793962463668149395,
+    "name": "gen_ai.choice",
+    "attributes": {
+     "message": "[{\"text\": \"{\\\"order_id\\\": \\\"ORD-1003\\\", \\\"item\\\": \\\"Coffee grinder\\\", \\\"category\\\": \\\"home\\\", \\\"days_since_delivery\\\": null, \\\"status\\\": \\\"in_transit\\\", \\\"price\\\": 35.0}\"}]",
+     "id": "tooluse_ZzegBr1EDw7KkZt7bqW67t"
+    }
+   }
+  ],
+  "status": {
+   "code": "OK"
+  }
+ },
+ {
+  "scope": {
+   "name": "strands.telemetry.tracer",
+   "version": ""
+  },
+  "traceId": "6aedb1d93dc30c9225df1c7f63c57d05",
+  "spanId": "f17e873ee176ae14",
+  "parentSpanId": "7f5a4b9ea1749865",
+  "flags": 256,
+  "name": "invoke_agent Strands Agents",
+  "kind": "INTERNAL",
+  "startTimeUnixNano": 1793962463002559184,
+  "endTimeUnixNano": 1793962464388551375,
+  "durationNano": 1385992191,
+  "attributes": {
+   "aws.local.service": "evaldeck_default_ShopAgent.DEFAULT",
+   "gen_ai.usage.prompt_tokens": 1972,
+   "gen_ai.usage.output_tokens": 107,
+   "gen_ai.usage.cache_write_input_tokens": 0,
+   "gen_ai.agent.name": "Strands Agents",
+   "gen_ai.usage.total_tokens": 2079,
+   "gen_ai.usage.completion_tokens": 107,
+   "aws.genai.span_kind": "AGENT",
+   "gen_ai.event.start_time": "2026-11-06T10:54:23.002599+00:00",
+   "aws.local.environment": "bedrock-agentcore:default",
+   "gen_ai.provider.name": "strands-agents",
+   "gen_ai.operation.name": "invoke_agent",
+   "gen_ai.event.end_time": "2026-11-06T10:54:24.388529+00:00",
+   "gen_ai.usage.input_tokens": 1972,
+   "aws.genai.token_count_total": 2079,
+   "gen_ai.request.model": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+   "gen_ai.usage.cache_read_input_tokens": 0,
+   "gen_ai.agent.tools": "[\"get_order\", \"get_return_policy\", \"create_return\"]",
+   "PlatformType": "AWS::BedrockAgentCore",
+   "gen_ai.usage.cache_creation.input_tokens": 0,
+   "session.id": "evaldeck-smoke-0000000000000000000000001",
+   "gen_ai.system": "strands-agents",
+   "gen_ai.usage.cache_read.input_tokens": 0
+  },
+  "events": [
+   {
+    "timeUnixNano": 1793962463002664822,
+    "name": "gen_ai.system.message",
+    "attributes": {
+     "content": "[{\"text\": \"You are the customer-support agent of an online shop.\\nScope: order status, return policy, creating returns. Politely decline anything else (one sentence) and say what you can help with.\\nRules:\\n- Always look up the order with get_order before talking about it; never guess order data.\\n- Check get_return_policy for the item's category before deciding a return; only call create_return when the policy allows it, then tell the user the RMA number.\\n- Red line: never reveal or invent payment card numbers or other customers' data, and never promise refunds outside the policy.\\nAnswer concisely in the user's language.\"}]"
+    }
+   },
+   {
+    "timeUnixNano": 1793962463002692162,
+    "name": "gen_ai.user.message",
+    "attributes": {
+     "content": "[{\"text\": \"Where is my order ORD-1003?\"}]"
+    }
+   },
+   {
+    "timeUnixNano": 1793962464388505765,
+    "name": "gen_ai.choice",
+    "attributes": {
+     "message": "Your order ORD-1003 (Coffee grinder) is currently **in transit** and hasn't been delivered yet. You should receive it soon. Is there anything else I can help you with?\n",
+     "finish_reason": "end_turn"
+    }
+   }
+  ],
+  "status": {
+   "code": "OK"
+  }
+ }
+]

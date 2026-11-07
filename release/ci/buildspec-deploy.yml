@@ -1,0 +1,27 @@
+# Step 4 Release - DeployStaging stage in AWS CodeBuild (release/ci/pipeline.yaml: Source -> DeployStaging -> Gate
+# -> Approval -> Release). Same step as the GitHub `deploy_staging` job: agentcore deploy, point STAGING at the new
+# runtime version, check that PROD did not move, write out/staging.json (runtime / bundle / dataset version, gate_key).
+# Runs with DeployRole: CDK deploy + UpdateAgentRuntimeEndpoint on STAGING only; PROD and DEFAULT are denied.
+# Project env: AGENT_RUNTIME_ARN, BUNDLE_ID / BUNDLE_VERSION (optional), SKIP_DEPLOY.
+version: 0.2
+env:
+  variables:
+    PYTHON: python3
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+      nodejs: 22
+    commands:
+      - cd starter-kit
+      - pip install -q -r requirements.txt uv            # uv: agentcore packages the CodeZip runtime with it
+      - npm i -g @aws/agentcore@1.0.1 >/dev/null
+      - (cd agent/evaldeck/agentcore/cdk && npm ci --no-audit --no-fund >/dev/null)
+  build:
+    commands:
+      - export GIT_COMMIT="${GIT_COMMIT:-$CODEBUILD_RESOLVED_SOURCE_VERSION}"
+      - bash release/deploy_staging.sh
+artifacts:
+  base-directory: starter-kit/out
+  files:
+    - staging.json

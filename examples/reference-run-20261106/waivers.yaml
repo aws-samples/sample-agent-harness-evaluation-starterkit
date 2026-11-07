@@ -1,0 +1,16 @@
+# Step 4 Release - gate waivers read by release/gate.py (default --waivers release/waivers.yaml).
+# A waiver lets a named approver ship while ONE `gate` metric is below its threshold but above a floor, until a date.
+# It never covers: red lines (refused, reported), regressions vs the baseline, missing measurements, evaluator
+# errors, a Config bundle that was not verified. Expired or incomplete entries are ignored and reported.
+# Fields: metric (required), segment (optional: acceptance | sim; default all), floor, expires (YYYY-MM-DD),
+#         approver, reason (all required), ticket (optional). Keep the list short and the expiry close.
+waivers:
+  # 2026-11-06: on the RELEASED version (PROD v3) the simulated personas already score ScopeJudge 0.67 (n=3):
+  # the impatient persona's follow-ups are judged out of scope. The 0.8 threshold was set on acceptance rows.
+  - metric: evaldeck_ScopeJudge
+    segment: sim
+    floor: 0.50
+    expires: 2026-11-20
+    approver: starter-kit-maintainer@example.com
+    reason: persona follow-ups judged out of scope on the released version too; recalibrate the sim threshold
+    ticket: EVAL-SIM-1

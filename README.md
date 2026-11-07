@@ -1,0 +1,168 @@
+# Agent-DLC starter-kit: AgentCore Evaluations / Optimization in six steps
+
+Runnable reference scripts for the self-improving loop ① Define ② Build ③ Evaluate ④ Release ⑤ Observe ⑥ Feedback on
+Amazon Bedrock AgentCore. Every script below was run end to end against a real AgentCore Runtime agent in a test
+account on **2026-11-06** (us-east-1, AgentCore CLI 1.0.1, bedrock-agentcore SDK 1.25.3), and the production release path
+(STAGING / PROD endpoints, Config bundle per request, gate -> SSM record -> release -> rollback, DEFAULT Deny, waivers,
+Gateway ship / canary rules, Policy LOG_ONLY -> ENFORCE, CodePipeline) was added and run the same day ("v2"); the lessons from those runs are in the script headers and in
+"Things the run taught" below. The demo agent and its data are fictional (演示数据).
+
+## 与 lifecycle 参考实现的关系
+
+starter-kit 是在 [ac-evaluation-golden-dataset-demo / lifecycle](https://github.com/huanghang111/ac-evaluation-golden-dataset-demo/tree/main/lifecycle)
+的基础上重新编写的模板工程: clone 之后按「从零运行」一节的顺序执行, 就能在自己的账号里跑通六步。
+lifecycle 收尾的「从零搭建清单」把参考实现分成两部分: 平台通用的部分 (流水线、门禁、发布、回滚、回流脚本) 和每个 Agent
+自己要写的部分 (PRD、数据集、判官、后端), 并把它作为 starter project 的需求。starter-kit 按这个要求实现: 平台部分做成可复用的脚本,
+Agent 部分只留一个最小骨架。需要更多细节时, 到 lifecycle 中查看。
+
+| | lifecycle (参考实现) | starter-kit (本目录) |
+|---|---|---|
+| 定位 | 完整的参考实现与讲解材料: 客户版 / 开发者版 deck、HTML 站点、field notes | 精简、可复用的模板工程, 配合技术实践版 PPT 讲解 |
+| Agent | 3 个 (电商客服 / 证券投顾 / 智能家居), 真实后端 | 1 个 ShopAgent, mock 工具 |
+| 轮次 | 0→1 首发 + R1 (提示词) / R2 (工具与后端) / R3 (经验库 + 策略), 有台账和每次门禁的记录 | 一轮完整闭环 + 生产发布路径 (v2) |
+| 数据集 | acceptance、release_gate、redteam、simulated_users、dev_smoke、prod_badcase、judge_regression, 带血缘 | acceptance、personas、judge_regression |
+| 版本 | AgentCore CLI 1.0.0-rc.5 (2026-11-04) | AgentCore CLI 1.0.1 / SDK 1.25.3, 2026-11-06 全部实测 |
+
+只在 lifecycle 中有、需要时去那里看:
+
+- 三段门禁 (gate / sim / redteam), 红队段红线 0 违规是硬门槛
+- 每个 Agent 一条 CI + 一条 CD 流水线 (CDK), 部署时钉版本、加部署锁、写部署记录
+- 告警 + 安全网回滚 Lambda + eval-silent 复合告警 (`ops-stack.ts`)、网关 TRACES 投递、前门网关栈
+- Cedar 策略从 LOG_ONLY 到 ENFORCE 的完整过程 (两个 Agent 都切到了 ENFORCE)
+- 经验库: Memory EPISODIC + 召回钩子, 用消融实验验证
+- bad case 的 AI 预审 → 复核 → 发布 → 晋级, 行里带回线上会话的 id
+- IDE 内环 (Dev Server、Trace Explorer、托管提示词 + Playground、Experiments)、Vibe Coding 实录、Omni Web 截图与录屏
+- 多轮的五维趋势、成本与延迟、线上结果、时间线, 以及按 FN 编号整理的踩坑记录
+
+starter-kit 相对 lifecycle 新增或改进的:
+
+- 不写死账号、区域、profile 和 Agent 列表, 资源名前缀用 `NAME_PREFIX` 配置 (lifecycle 清单里列出的局限)
+- CustomDerived 评估器 (`ThirdParty.DeepEval.TaskCompletion`)、`Builtin.FailureAnalysis` 根因分析、`run_ondemand.py` 的数据摄取检查
+  (会话结束不到 5 分钟就拒绝打分)、GitHub Actions 版 CI、实际部署的 90/10 canary GatewayRule
+- 两边都有的机制 (gate_key、bundle 版本校验、豁免、DEFAULT Deny、A/B 发布、Policy LOG_ONLY → ENFORCE) 各收成一个脚本,
+  并给出每一步的最小 IAM; 两边写法不同时以 starter-kit 为准
+
+## Setup
+
+```bash
+npm i -g @aws/agentcore                                  # AgentCore CLI 1.0.x, Node >= 20.12
+python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+export AWS_PROFILE=<profile> AWS_REGION=us-east-1        # nothing in the kit hard-codes an account, profile or region
+export PYTHON=.venv/bin/python                           # used by the .sh scripts
+```
+Prerequisites in the account: Bedrock model access (the kit uses Claude Haiku 4.5 for agent, judges and the simulated
+user), CloudWatch Transaction Search (`agentcore deploy` enables it). Optional env: `AGENT_RUNTIME_ARN` (else read
+from `agentcore status`), `AGENT_ENDPOINT` (`DEFAULT` | `STAGING` | `PROD`, default `STAGING`; also `--endpoint`),
+`BUNDLE_ID` + `BUNDLE_VERSION` (Config bundle version sent as baggage; also `--bundle` / `--bundle-version`),
+`GATEWAY_ID`, `NAME_PREFIX` (default `evaldeck`), `EVAL_OUT` (`out/`), `EVAL_CONCURRENCY` (macOS: `1`, see below).
+Every script writes its results to `out/` in one normalized format (`evaldeck.results/v1`) that `release/gate.py` and
+`feedback/mine_badcases.py` read.
+
+## Step -> files -> what it does -> verified
+
+| Step | File | What it does | Verified |
+|---|---|---|---|
+| ① Define | `define/requirements.yaml` | PRD as data: requirement -> dimension -> evaluator -> threshold -> tier (redline / gate / observe), gate policy | ✅ ran on 2026-11-06 |
+| ① | `define/gen_gate.py` | requirements.yaml -> `define/gate.yaml` (validated translation; `--check` for CI) | ✅ ran on 2026-11-06 |
+| ① | `define/datasets/acceptance.jsonl`, `publish_dataset.py` | `AGENTCORE_EVALUATION_PREDEFINED_V1` scenarios (turns, expected_response, expected_trajectory, assertions, metadata); create + publish an immutable version, only when content changed; `registry.json` pins versions | ✅ ran on 2026-11-06 (v1-v4) |
+| ① | `define/datasets/personas.jsonl` | `AGENTCORE_EVALUATION_SIMULATED_V1` personas (actor_profile, input, max_turns, assertions) | ✅ ran on 2026-11-06 |
+| ① | `define/evaluators/judge_scope.json`, `derived_taskcompletion.json`, `register_evaluators.py` | Custom LLM judge (TRACE, numerical 0/0.5/1) and CustomDerived (ThirdParty.DeepEval.TaskCompletion on your model); create-or-update | ✅ ran on 2026-11-06 |
+| ① | `define/evaluators/code_eval/` (`handler.py`, `deploy.sh`, `test_handler.py`) | CustomCode Lambda red line (card numbers, return outside window), deployed + registered with `agentcore eval evaluator code-based create` | ✅ ran on 2026-11-06 |
+| ① | `define/calibrate.py`, `define/labels/` | judge vs labels: low-score-first sampling, agreement >= 0.85 or exit 1 | ✅ ran on 2026-11-06 (labels are demo labels) |
+| ② Build | `agent/` (`agent/README.md`) | minimal Strands agent project (`agentcore create/deploy`), mock tools, system prompt from a Configuration bundle with a code default | ✅ ran on 2026-11-06 |
+| ③ Evaluate | `evaluate/send_traffic.py` | replay dataset turns against the runtime, record session ids | ✅ ran on 2026-11-06 |
+| ③ | `evaluate/run_ondemand.py` | `Evaluate` API over real session ids, one evaluator per call, level-aware targets, ground truth as reference inputs, ingestion guard | ✅ ran on 2026-11-06 |
+| ③ | `evaluate/run_dataset.py` | `OnDemandEvaluationDatasetRunner` (`--mode ondemand`) or `BatchEvaluationRunner` / `StartBatchEvaluation` (`--mode batch`, incl. `Builtin.FailureAnalysis`) over a pinned Dataset version | ✅ ran on 2026-11-06 (both modes) |
+| ③ | `evaluate/simulate.py` | user simulation: `SimulationConfig` + `ActorProfile` personas, scored like any session | ✅ ran on 2026-11-06 (2 personas) |
+| ② | `agent/evaldeck/agentcore/agentcore.json` | named endpoints `STAGING` + `PROD` (DEFAULT follows latest); Gateway targets `shop` -> PROD, `shopStaging` -> STAGING; agent spans carry `evaldeck.prompt_source` + bundle version | ✅ v2: deployed (PROD imported into the stack, STAGING created, runtime v4) |
+| ④ Release | `release/deploy_staging.sh` | endpoint pins = the deployed template's pins -> `agentcore deploy` -> STAGING -> newest version -> PROD-unchanged check -> `out/staging.json` {runtimeVersion, bundleVersion, datasetVersion, gitCommit, gate_key} | ✅ v2: ran locally (STAGING 1 -> 4) and in CodeBuild (runtime v5); v3: own DeployStaging stage (runtime v8, STAGING 5 -> 8, PROD stayed 5) |
+| ④ | `release/protect_prod.sh` | one-time: CloudFormation stack policy denying every update of the PROD `RuntimeEndpoint` resource + termination protection on the agent stack | ✅ v3: applied; a deploy that changed the PROD pin failed with "Action denied by stack policy" and rolled back, PROD stayed 5 |
+| ④ | `release/gate_key.py`, `test_gate_key.py` | gate_key = sha256(commit, runtimeVersion, bundleVersion, datasetVersion, sha256(gate.yaml)); `--staging --check` recomputes | ✅ v2: unit tests; release refused a tampered staging.json |
+| ④ | `release/gate.py`, `release/baseline.json`, `release/waivers.yaml`, `test_gate.py` | PASS / BLOCKED per segment (`acceptance` = run_dataset, `sim` = simulate): thresholds, red line = 0, no regression (`max(tol, step/n)`), baseline per segment + dataset version, missing results / unverified bundle = blocked; waivers (gate metric only, floor, expiry, approver; red line refused) | ✅ v2: STAGING gate PASS (bundle verified 8/8 sessions); waiver applied + red-line waiver refused; 27 release unit tests |
+| ④ | `release/record.py` | gate decision -> SSM `/evaldeck/gate/<gate_key>` (latest decision wins) | ✅ v2: ran |
+| ④ | `release/release.sh` | needs PASS record for the recomputed gate_key + approver -> PROD -> tested version, bundle pinned on the Gateway -> `/evaldeck/release/current` + `/previous` | ✅ v2: PROD 3 -> 4 (local) and 4 -> 5 (pipeline Release stage, approver read from the Manual action); refused: no approver / tampered key / no record |
+| ④ | `release/rollback_lambda.py`, `test_rollback_lambda.py` | alarm -> EventBridge -> Lambda: PROD (and bundle rule) back to `/release/previous`, once per release; A/B paused instead; eval-silent notifies only | ✅ v2: unit tests + live drill PROD 4 -> 3 from SSM previous, then re-release (handler run locally, not deployed) |
+| ④ | `release/harden_default.sh` | Deny resource policy on the DEFAULT endpoint ARN (merged into an existing policy), then invokes DEFAULT / STAGING / PROD | ✅ v2: DEFAULT AccessDenied, STAGING / PROD 200; kit scripts re-run on STAGING / PROD afterwards |
+| ④ | `release/ci/gate_step.sh` | the one gate step both CI systems call: gen_gate --check, pytest, acceptance + sim on STAGING with the bundle, gate.py | ✅ v2: ran locally (PASS) and in CodeBuild (PASS, gate_key `09343404ec438537`) |
+| ④ | `release/ci/github-actions.yml` | `pr` job (checkout, setup-python/node, OIDC with aws-region, install, deploy_staging with the deploy role, then the gate role for gate + record, artifact, PR comment; STAGING concurrency lock) + `release` job on main with `environment: production` | ⚠ actionlint clean (incl. shellcheck); not run on GitHub (no repo / OIDC role in the test account) |
+| ④ | `release/ci/buildspec-deploy.yml`, `buildspec.yml`, `buildspec-release.yml`, `pipeline.yaml` | CodePipeline V2 (QUEUED): Source (S3 or CodeConnections) -> DeployStaging (CodeBuild) -> Gate (CodeBuild) -> Manual approval (gate_key + versions + report link) -> Release (CodeBuild); one role per stage: only DeployRole deploys (STAGING only), GateRole cannot deploy or change any endpoint, only ReleaseRole moves PROD | ✅ v2: cfn-lint + validate-template + deployed (`evaldeck-pipeline`, S3 source = zip of the kit); one execution Source -> Gate (PASS) -> Approval (approved with `put-approval-result`) -> Release (PROD 4 -> 5). GitHub/CodeConnections source variant not run |
+| ④ | `release/ab_test.sh` | config-bundle A/B through AgentCore Gateway (control = current prompt, treatment = candidate), results with p-value / CI, stop | ✅ ran on 2026-11-06 (12 sessions: mechanics only, no significance expected) |
+| ④ | `release/ab_ship.sh` | after `ab-test stop`: decide (significant on the primary, nothing significantly worse, min samples) -> static-override Gateway rule for the winner; `pin` / `restore` / `show` | ✅ v2: decision C (kept, no rule); forced T1 drill: rule pinned T1, spans showed T1's version, `restore` pinned the released bundle again |
+| ④ | `release/canary_rule.yaml` | CloudFormation `AWS::BedrockAgentCore::GatewayRule`: weighted route 90/10 between the PROD and STAGING targets | ✅ v2: cfn-lint + validate-template + deployed (`evaldeck-canary`); 20 sessions -> 13 PROD / 5 STAGING (2 not found in spans) |
+| ④ | `release/policy.sh` | AgentCore Policy: engine + ACTIVE permit + LOG_ONLY shadow forbid -> engine LOG_ONLY (UpdateGateway) -> audit metrics (PolicyEngine + OperationName dims) -> ENFORCE | ✅ v2: ran on the evaldeck Gateway (harmless rules); 3 decisions logged, then ENFORCE, traffic still 200 |
+| ⑤ Observe | `observe/online_eval.sh` | Online evaluation config on the runtime endpoint (sampling, session timeout, judges without ground truth) | ✅ ran on 2026-11-06 (100 % sampling for a tiny test) |
+| ⑤ | `observe/alarms.yaml` | CloudFormation: red-line alarm, goal-score alarm with minimum samples, eval-silent alarm (traffic but no red-line results) | ✅ deployed on 2026-11-06 (`evaldeck-alarms`, all OK) |
+| ⑥ Feedback | `feedback/mine_badcases.py` | low online / batch / simulation scores -> candidate rows with lineage (session, trace, evaluator, score, explanation), no evaluator cost | ✅ ran on 2026-11-06 |
+| ⑥ | `feedback/promote.py`, `feedback/reviewed/` | reviewed rows -> acceptance dataset (accept) or judge-regression set (judge_error); publish a new version only if content changed | ✅ ran on 2026-11-06 (v3, idempotent re-run) |
+| ⑥ | `feedback/failure_analysis.sh` | Batch evaluation with `Builtin.FailureAnalysis`: insights -> root causes -> suggested fix -> span-level findings | ✅ ran on 2026-11-06 |
+| ⑥ | `feedback/recommend.sh` | AgentCore Recommendations (system prompt) from traces + one reward evaluator | ✅ ran on 2026-11-06 |
+
+## The loop as it ran on 2026-11-06 (演示数据)
+
+1. ① 5 acceptance scenarios -> Dataset v1; judge, derived and Lambda evaluators registered; gate.yaml generated.
+2. ③ on-demand, dataset (on-demand + batch) and 2 simulated personas scored the agent; one persona exposed a real
+   defect (a defective item refused as "damaged").
+3. ⑥ the defect was mined from online / simulation scores, reviewed, promoted -> Dataset v3; FailureAnalysis
+   independently named the same root cause with a span id.
+4. ④ the CI gate on v3 BLOCKED (regression + baseline on the old dataset version). Prompt fixed, baseline re-measured on
+   the PROD endpoint (v1) on dataset v4, candidate (v3) gate **PASS**; PROD moved to v3; rollback drill PROD 3 -> 1 -> 3.
+5. ⑤ online evaluation + alarms on the endpoint; Recommendations produced a candidate prompt that was A/B-tested
+   against the current prompt through the Gateway.
+6. v2 ④ production path: STAGING + PROD declared in agentcore.json; `deploy_staging.sh` built runtime v4 and moved
+   STAGING; baselines re-measured on PROD (v3) for both segments; the gate on STAGING scored Config bundle version
+   `649aeb81` (sent as baggage, verified in every session's `invoke_agent` span) -> PASS -> SSM record -> `release.sh`
+   PROD 3 -> 4 + bundle pinned on the Gateway; rollback drill 4 -> 3 from `/evaldeck/release/previous`; re-release;
+   DEFAULT denied; A/B ship drill; 90/10 canary rule; Policy LOG_ONLY -> ENFORCE; the same path once more through
+   CodePipeline (S3 source -> Gate in CodeBuild: deploy runtime v5 + gate PASS -> CLI approval -> Release PROD 4 -> 5; two IAM / YAML fixes on the way).
+
+## Things the run taught (also in the script headers)
+
+- Wait for ingestion: scoring a session ~40 s after it ended scored half a conversation silently
+  (`run_ondemand.py` now refuses sessions younger than 5 min and flags `PartialSession`).
+- The dataset runner applies every evaluator to every row: rows without `expected_trajectory` return
+  `EvaluationRequestValidationError` for trajectory evaluators - keep those metrics `observe` or run them on the subset.
+- Batch job summaries can show `average_score: null` for a code evaluator while the per-session events carry values:
+  gate on the per-session results.
+- Alarm on `{service.name, onlineEvaluationConfigId}`; `{service.name}` alone also receives batch / CI scores.
+- Online results arrived ~15 min after traffic; read them with GetLogEvents or Logs Insights.
+- A replayed multi-turn bad case goes stale once the agent behaves differently; keep the failing turn or use a persona.
+- Judge scores flip on identical answers: regression tolerance must be at least one score step / n.
+- The CLI-provisioned online-eval role can invoke every Lambda in the account; use `--role-arn` in production.
+- v2: endpoint versions in agentcore.json are creation pins; CloudFormation re-applies them whenever the endpoint
+  resource changes. v3: `deploy_staging.sh` copies the DEPLOYED template's pins into agentcore.json, so the endpoint
+  resources never get a change-set entry (writing the live PROD version would be a PROD change the stack policy denies).
+- v2: the gate only proves it tested the shipped prompt if the agent says so: spans carry `evaldeck.prompt_source`
+  and the bundle version, and `gate.py` blocks when any gate session did not use the expected version.
+- v2: a Deny on the DEFAULT **endpoint** ARN blocks only DEFAULT; on the runtime ARN it would block every endpoint.
+- v2: Gateway rules resolve bundle and route actions independently - the ship rule (bundle, 100) and the canary
+  (route, 200) apply to the same request.
+- v2: Policy metrics need the full dimension set: `{OperationName, PolicyEngine}` returns data, `{PolicyEngine}`
+  alone returns none; the engine attached in LOG_ONLY still records `AllowDecisions` with `Mode=LOG_ONLY`.
+- v2: macOS + Python 3.12: the SDK runner segfaulted again in concurrent TLS handshakes (span collection);
+  `EVAL_CONCURRENCY=1` locally, the default 5 on Linux CI.
+
+## Minimum IAM per step (what the v2 run actually needed)
+
+Scope every `bedrock-agentcore` action to the runtime ARN **and** `<runtime-arn>/runtime-endpoint/*` (invokes and
+endpoint updates are authorized on the endpoint child ARN as well). The CodeBuild roles in `release/ci/pipeline.yaml`
+are these lists, validated by the pipeline run. v3 split: DeployRole = the deploy_staging.sh row with
+`UpdateAgentRuntimeEndpoint` on `runtime-endpoint/STAGING` only and an explicit Deny on PROD / DEFAULT; GateRole =
+the ③ row + record.py, with explicit Denies on every endpoint / runtime change and on `sts:AssumeRole` to `cdk-*`;
+ReleaseRole = release.sh with `runtime-endpoint/PROD` only (checked with the IAM policy simulator).
+The CDK deploy itself runs as the CDK bootstrap execution role (AdministratorAccess by default): protect the PROD
+endpoint with `release/protect_prod.sh`; in production put STAGING and PROD in separate accounts.
+
+| Step / script | Needs |
+|---|---|
+| ③ send_traffic / run_dataset / simulate (caller = CI gate role) | `bedrock-agentcore:InvokeAgentRuntime` (STAGING), `Evaluate`, `ListEvaluators`, `GetEvaluator`, `GetDataset`, `ListDatasetExamples`, `ListDatasetVersions`, `GetConfigurationBundleVersion`; **logs:StartQuery / GetQueryResults / FilterLogEvents** on `/aws/bedrock-agentcore/runtimes/*` and `aws/spans` (span collector, ingestion guard, bundle_check); `bedrock:InvokeModel` (custom / derived judges and the simulated user run on the caller's credentials); `lambda:InvokeFunction` + `GetFunction` on the CustomCode evaluator |
+| ④ deploy_staging.sh (DeployRole) | CDK deploy = `sts:AssumeRole` on `cdk-hnb659fds-*`; the CLI itself reads `cloudformation:DescribeStacks` on the project stack **and `CDKToolkit`** (+ `GetTemplate` for the pin sync), `ssm:GetParameter /cdk-bootstrap/*`, Transaction Search read (`xray:GetTraceSegmentDestination`, `GetIndexingRules`, `logs:DescribeResourcePolicies`); `ListAgentRuntimeVersions`, `ListAgentRuntimeEndpoints`, `GetAgentRuntimeEndpoint`, `UpdateAgentRuntimeEndpoint` (STAGING only; PROD / DEFAULT denied) |
+| ④ protect_prod.sh (platform admin, once) | `cloudformation:GetTemplate`, `SetStackPolicy`, `UpdateTerminationProtection` on the agent stack |
+| ④ record.py | `ssm:PutParameter`, `ssm:AddTagsToResource` on `parameter/<prefix>/gate/*` |
+| ④ release.sh | **`ssm:GetParameter`** on `parameter/<prefix>/*`, **`ssm:PutParameter` / `AddTagsToResource`** on `parameter/<prefix>/release/*`; `GetAgentRuntimeEndpoint`, `UpdateAgentRuntimeEndpoint` (PROD); `ListGatewayRules`, `CreateGatewayRule`, `UpdateGatewayRule`; in CodePipeline `codepipeline:ListActionExecutions` (who approved) |
+| ④ rollback_lambda.py | `UpdateAgentRuntimeEndpoint` (PROD), `ListGatewayRules` / `UpdateGatewayRule` (if GATEWAY_ID), `GetABTest` / `UpdateABTest` (if AB_TEST_ID), `ssm:GetParameter` / `PutParameter` on `parameter/<prefix>/release/*` |
+| ④ harden_default.sh | `GetResourcePolicy`, `PutResourcePolicy` on `<runtime-arn>/runtime-endpoint/DEFAULT`, `ListAgentRuntimeEndpoints` |
+| ④ ab_ship.sh | `GetABTest`, `ListGatewayRules`, `CreateGatewayRule`, `UpdateGatewayRule`; `ssm:GetParameter` (restore) |
+| ④ policy.sh | `CreatePolicyEngine`, `GetPolicyEngine`, `ListPolicyEngines`, `CreatePolicy`, `ListPolicies`, `GetGateway`, `UpdateGateway`, `iam:PassRole` on the Gateway role, `iam:PutRolePolicy` (grants the Gateway role `GetPolicyEngine`, `CheckAuthorizePermissions`, `AuthorizeAction`, `PartiallyAuthorizeActions` on engine + gateway), `cloudwatch:ListMetrics` / `GetMetricData` |
+| ⑤ online_eval.sh | own execution role (`--role-arn`): logs read on the runtime log group, logs write on `/aws/bedrock-agentcore/evaluations/*`, `bedrock:InvokeModel`, `lambda:InvokeFunction` + `GetFunction` on the code evaluator only |
+
+Slide-ready excerpts of every script: [`SNIPPETS.md`](SNIPPETS.md).

@@ -1,0 +1,62 @@
+# Step 4 Release - canary through the front-door Gateway: weighted route 90 / 10 between two targets.
+#
+# The two targets are the same runtime on two endpoints (agentcore.json: `shop` -> PROD, `shopStaging` -> STAGING),
+# so 10 % of front-door sessions run the candidate before PROD moves. Gateway rules do not score anything: watch
+# the STAGING online evaluation / alarms (or run an A/B test, which adds the statistics) and then release.sh or
+# delete this stack. Rules resolve each action type independently: this routeToTarget rule (priority 200) and the
+# configurationBundle ship rule (release/ab_ship.sh, priority 100) both apply to a request.
+# Limits: exactly 2 split entries, weights 1-99 summing to 100, priority unique per gateway (1-1,000,000).
+#
+# Deploy:
+#   aws cloudformation deploy --stack-name evaldeck-canary --template-file release/canary_rule.yaml \
+#     --parameter-overrides GatewayId=<gateway-id> Split=90/10
+# Widen / abort: redeploy with Split=75/25 or 50/50, or delete the stack (traffic returns to the path's target).
+AWSTemplateFormatVersion: "2010-09-09"
+Description: evaldeck - canary Gateway rule, weighted route between the PROD and STAGING targets
+Parameters:
+  GatewayId:
+    Type: String
+    AllowedPattern: "^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$"
+    Description: deployed Gateway id (agentcore status --json, resource type gateway)
+  StableTarget:
+    Type: String
+    Default: shop
+    Description: Gateway target that serves PROD
+  CanaryTarget:
+    Type: String
+    Default: shopStaging
+    Description: Gateway target that serves the candidate (STAGING)
+  Split:
+    Type: String
+    Default: 90/10
+    AllowedValues: [99/1, 95/5, 90/10, 75/25, 50/50]
+    Description: stable / canary percent of matching traffic (two entries that sum to 100)
+  Priority:
+    Type: Number
+    Default: 200
+    MinValue: 1
+    MaxValue: 1000000
+Resources:
+  CanaryRule:
+    Type: AWS::BedrockAgentCore::GatewayRule
+    Properties:
+      GatewayIdentifier: !Ref GatewayId
+      Priority: !Ref Priority
+      Description: !Sub "evaldeck-canary: ${StableTarget} / ${CanaryTarget} = ${Split}"
+      Conditions:
+        - MatchPaths:
+            AnyOf:
+              - !Sub "/${StableTarget}/*"
+      Actions:
+        - RouteToTarget:
+            WeightedRoute:
+              TrafficSplit:
+                - Name: stable
+                  TargetName: !Ref StableTarget
+                  Weight: !Select [0, !Split ["/", !Ref Split]]
+                - Name: canary
+                  TargetName: !Ref CanaryTarget
+                  Weight: !Select [1, !Split ["/", !Ref Split]]
+Outputs:
+  RuleId:
+    Value: !GetAtt CanaryRule.RuleId

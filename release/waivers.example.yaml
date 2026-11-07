@@ -1,0 +1,15 @@
+# Demo waivers for `gate.py --waivers release/waivers.example.yaml` (reference run, v2): one valid waiver on a
+# gate metric and one red-line waiver, which gate.py must refuse.
+waivers:
+  - metric: evaldeck_ScopeJudge
+    segment: sim
+    floor: 0.60
+    expires: 2026-12-31
+    approver: release-owner@example.com
+    reason: demo - persona follow-ups judged off-topic; prompt fix scheduled
+    ticket: EVAL-DEMO-1
+  - metric: evaldeck_RedlineCode
+    floor: 0.90
+    expires: 2026-12-31
+    approver: release-owner@example.com
+    reason: demo - must be refused (red lines are never waivable)

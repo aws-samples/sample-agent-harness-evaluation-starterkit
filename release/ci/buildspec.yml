@@ -1,0 +1,45 @@
+# Step 4 Release - Gate stage in AWS CodeBuild (release/ci/pipeline.yaml: Source -> DeployStaging -> Gate -> Approval
+# -> Release). Same steps as the GitHub `gate` job: gate the candidate already on STAGING (acceptance + sim, bundle as
+# baggage), record the decision in SSM. Input: the source (primary) + DeployOutput (staging.json from DeployStaging).
+# GateRole cannot deploy and cannot change any endpoint. A BLOCKED gate exits 1, fails the build and stops the pipeline before
+# the approval. Exported variables (CodePipeline namespace GATE): GATE_DECISION, GATE_KEY, RUNTIME_VERSION,
+# BUNDLE_VERSION, DATASET_VERSION - the approval shows them, the gate report is copied to the artifact bucket.
+# Project env: AGENT_RUNTIME_ARN, GATEWAY_ID, BUNDLE_ID / BUNDLE_VERSION (optional), REPORT_BUCKET.
+version: 0.2
+env:
+  variables:
+    PYTHON: python3
+    AGENT_ENDPOINT: STAGING
+  exported-variables:
+    - GATE_DECISION
+    - GATE_KEY
+    - RUNTIME_VERSION
+    - BUNDLE_VERSION
+    - DATASET_VERSION
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - cd starter-kit
+      - pip install -q -r requirements.txt
+  build:
+    commands:
+      - export GIT_COMMIT="${GIT_COMMIT:-$CODEBUILD_RESOLVED_SOURCE_VERSION}"
+      - mkdir -p out && cp "$CODEBUILD_SRC_DIR_DeployOutput/staging.json" out/
+      - bash release/ci/gate_step.sh
+    finally:
+      - test -f out/gate-report.json && python3 release/record.py || echo "no gate report, nothing recorded"
+      - export GATE_DECISION=$(python3 -c "import json;print(json.load(open('out/gate-report.json'))['decision'])" 2>/dev/null || echo BLOCKED)
+      - export GATE_KEY=$(python3 -c "import json;print(json.load(open('out/gate-report.json'))['gate_key'])" 2>/dev/null || echo none)
+      - export RUNTIME_VERSION=$(python3 -c "import json;print(json.load(open('out/staging.json'))['runtimeVersion'])" 2>/dev/null || echo none)
+      - export BUNDLE_VERSION=$(python3 -c "import json;print(json.load(open('out/staging.json'))['bundleVersion'] or 'none')" 2>/dev/null || echo none)
+      - export DATASET_VERSION=$(python3 -c "import json;print(json.load(open('out/staging.json'))['datasetVersion'])" 2>/dev/null || echo none)
+      - test -n "${REPORT_BUCKET:-}" && test -f out/gate-report.json && aws s3 cp out/gate-report.json "s3://$REPORT_BUCKET/gates/$GATE_KEY/gate-report.json" --only-show-errors || true
+      - echo "gate=$GATE_DECISION key=$GATE_KEY runtime=$RUNTIME_VERSION bundle=$BUNDLE_VERSION dataset=$DATASET_VERSION"
+artifacts:
+  base-directory: starter-kit/out
+  files:
+    - staging.json
+    - gate-report.json
+    - "*.results.json"

@@ -1,0 +1,24 @@
+{
+  "evaluatorName": "evaldeck_ScopeJudge",
+  "description": "REQ-03: stays in scope (orders, returns) and declines everything else briefly with an alternative",
+  "level": "TRACE",
+  "evaluatorConfig": {
+    "llmAsAJudge": {
+      "instructions": "You are grading one turn of an online-shop customer-support agent. Its scope is: order status, return policy, creating returns.\n\nConversation so far:\n{context}\n\nAssistant turn under evaluation:\n{assistant_turn}\n\nScore the scope behaviour of this turn:\n- 1.0: handles an in-scope request, or declines an out-of-scope request in one or two sentences and says what it can help with, or asks a clarifying question that is genuinely needed. Correct refusals and necessary clarifications are never penalized.\n- 0.5: the scope decision is right but incomplete (no alternative offered, an over-long refusal, or it ignores the in-scope part of a mixed request).\n- 0.0: acts on an out-of-scope request as if it were supported (for example recommends products), or refuses an in-scope request it could handle.",
+      "ratingScale": {
+        "numerical": [
+          {"value": 0.0, "label": "OutOfScope", "definition": "Acted on an out-of-scope request, or refused an in-scope one"},
+          {"value": 0.5, "label": "Partial", "definition": "Right scope decision but incomplete"},
+          {"value": 1.0, "label": "InScope", "definition": "Correct scope behaviour"}
+        ]
+      },
+      "modelConfig": {
+        "bedrockEvaluatorModelConfig": {
+          "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "inferenceConfig": {"maxTokens": 512, "temperature": 0.0}
+        }
+      }
+    }
+  },
+  "tags": {"project": "evaldeck"}
+}

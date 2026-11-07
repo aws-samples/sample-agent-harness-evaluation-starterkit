@@ -1,0 +1,69 @@
+{
+  "name": "evaldeck",
+  "version": 2,
+  "managedBy": "CDK",
+  "runtimes": [
+    {
+      "name": "ShopAgent",
+      "modelProvider": "Bedrock",
+      "description": "evaldeck starter-kit demo agent (retail support, mock tools)",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/ShopAgent",
+      "runtimeVersion": "PYTHON_3_14",
+      "protocol": "HTTP",
+      "tags": {
+        "project": "evaldeck"
+      },
+      "endpoints": {
+        "STAGING": {
+          "version": 1,
+          "description": "evaldeck STAGING - candidate under test (moved by release/deploy_staging.sh)"
+        },
+        "PROD": {
+          "version": 1,
+          "description": "evaldeck PROD pinned to the released version"
+        }
+      }
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [
+    {
+      "name": "evaldeckFront",
+      "protocolType": "None",
+      "description": "evaldeck front door for A/B testing",
+      "targets": [
+        {
+          "name": "shop",
+          "targetType": "httpRuntime",
+          "httpRuntime": {
+            "runtime": "ShopAgent",
+            "runtimeEndpoint": "PROD"
+          }
+        },
+        {
+          "name": "shopStaging",
+          "targetType": "httpRuntime",
+          "httpRuntime": {
+            "runtime": "ShopAgent",
+            "runtimeEndpoint": "STAGING"
+          }
+        }
+      ],
+      "authorizerType": "AWS_IAM",
+      "enableSemanticSearch": false,
+      "exceptionLevel": "NONE",
+      "tags": {
+        "project": "evaldeck"
+      }
+    }
+  ],
+  "policyEngines": [],
+  "configBundles": [],
+  "harnesses": []
+}
