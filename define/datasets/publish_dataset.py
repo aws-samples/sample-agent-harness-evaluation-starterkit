@@ -33,9 +33,20 @@ REGISTRY = HERE / "registry.json"
 SCHEMA = {"predefined": "AGENTCORE_EVALUATION_PREDEFINED_V1", "simulated": "AGENTCORE_EVALUATION_SIMULATED_V1"}
 
 
+def _norm(v):
+    """The service stores 0.0 as 0 when a dataset is created from a file: compare integral floats as ints."""
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, dict):
+        return {k: _norm(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_norm(x) for x in v]
+    return v
+
+
 def canonical_rows(rows: list[dict]) -> list[str]:
-    return sorted(json.dumps({k: v for k, v in r.items() if k != "exampleId"}, sort_keys=True, ensure_ascii=False)
-                  for r in rows)
+    return sorted(json.dumps(_norm({k: v for k, v in r.items() if k != "exampleId"}), sort_keys=True,
+                             ensure_ascii=False) for r in rows)
 
 
 def find_dataset(name: str) -> dict | None:
