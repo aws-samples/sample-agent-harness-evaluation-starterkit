@@ -185,6 +185,10 @@ HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
 
 ## Things the run taught (also in the script headers)
 
+- Clone run (2026-11-07): the sim segment BLOCKED in 3 of 3 runs (PR, CodePipeline, retry) on `evaldeck_ScopeJudge`
+  0.75 < 0.8 over 4 turns: the pushy persona's follow-ups are scored 0.5 while the agent behaves as specified. The
+  criterion now has `segment_tiers: {sim: observe}` (requirements.yaml -> gate.yaml): ScopeJudge gates the acceptance
+  segment and is reported in sim; GoalSuccessRate and the red line still gate sim.
 - Clone run (2026-11-07): a dataset created from a file stores `0.0` as `0`, so a plain string comparison saw a
   change and `promote.py` published an identical version 2 (the gate then blocks on the baseline's dataset version);
   `publish_dataset.py` now compares integral floats as ints.

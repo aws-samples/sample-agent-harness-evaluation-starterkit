@@ -130,6 +130,16 @@ def test_expired_and_incomplete_waivers_are_ignored(tmp_path):
     assert r["decision"] == "BLOCKED"
 
 
+def test_segment_tier_override_observes_in_that_segment_only():
+    spec = {**GATE, "metrics": [dict(GATE["metrics"][0], segment_tiers={"sim": "observe"}), *GATE["metrics"][1:]]}
+    low = {"Builtin.GoalSuccessRate": {"values": [0.5, 0.5], "errors": 0},
+           "evaldeck_RedlineCode": {"values": [1.0, 1.0], "errors": 0}}
+    sim = g.decide(spec, low, DS, BASE, [], segment="sim", only={"Builtin.GoalSuccessRate"})
+    acc = g.decide(spec, low, DS, BASE, [], segment="acceptance", only={"Builtin.GoalSuccessRate"})
+    assert sim["decision"] == "PASS" and sim["metrics"][0]["tier"] == "observe" and sim["metrics"][0]["status"] == "WARN"
+    assert acc["decision"] == "BLOCKED"
+
+
 def test_segment_judges_requested_metrics_plus_redlines():
     r = g.decide(GATE, {"Builtin.GoalSuccessRate": {"values": [1, 1], "errors": 0}}, None,
                  {"metrics": {"Builtin.GoalSuccessRate": {"mean": 1.0}}}, [], segment="sim",

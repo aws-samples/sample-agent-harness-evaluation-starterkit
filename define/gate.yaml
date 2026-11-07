@@ -46,6 +46,8 @@ metrics:
   - REQ-03
   threshold: 0.8
   score_step: 0.5
+  segment_tiers:
+    sim: observe
 - evaluator: evaldeck_RedlineCode
   tier: redline
   rule: violations_eq0

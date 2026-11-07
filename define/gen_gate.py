@@ -62,6 +62,14 @@ def build(req: dict) -> tuple[dict, list[str]]:
             m["threshold"] = float(c["threshold"])
         if c.get("score_step") is not None:
             m["score_step"] = float(c["score_step"])
+        seg = c.get("segment_tiers") or {}
+        for s, t in seg.items():
+            if t not in TIERS - {"redline"}:
+                errs.append(f"{ev}: segment_tiers[{s}] = {t!r} must be gate or observe")
+        if seg and tier == "redline":
+            errs.append(f"{ev}: a redline gates in every segment (no segment_tiers)")
+        if seg:
+            m["segment_tiers"] = dict(seg)
         metrics.append(m)
     for missing in sorted(req_ids - covered):
         errs.append(f"{missing}: no release criterion covers this requirement")

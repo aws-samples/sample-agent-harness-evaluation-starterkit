@@ -16,7 +16,8 @@ decision lives here. Rules, from define/gate.yaml (generated from requirements.y
 Segments: every results file belongs to one segment (doc["segment"], or `--results sim=out/simulate-x.json`).
 `acceptance` (run_dataset.py on the pinned Dataset version) is judged on every metric in gate.yaml; other
 segments (`sim` = simulate.py, a `redteam` set if you add one) on the metrics their run requested, plus every
-red line. Each segment has its own baseline (baseline.json "segments"); all segments must PASS.
+red line. Each segment has its own baseline (baseline.json "segments"); all segments must PASS. A metric's
+`segment_tiers` (gate.yaml, from requirements.yaml) can make it observe-only in one segment; red lines never.
 
 Waivers (release/waivers.yaml): a named approver may lower the threshold of one `gate` metric to a floor until
 an expiry date. A waiver never covers a red line (refused), a regression, a missing measurement or errors;
@@ -170,7 +171,8 @@ def decide(gate: dict, metrics: dict, dataset: dict | None, baseline: dict | Non
     rows = []
     specs = [s for s in gate["metrics"] if only is None or s["evaluator"] in only or s["tier"] == "redline"]
     for spec in specs:
-        name, tier = spec["evaluator"], spec["tier"]
+        name = spec["evaluator"]
+        tier = (spec.get("segment_tiers") or {}).get(segment, spec["tier"]) if spec["tier"] != "redline" else "redline"
         m = metrics.get(name, {"values": [], "errors": 0})
         vals, errs = m["values"], m["errors"]
         n = len(vals)
