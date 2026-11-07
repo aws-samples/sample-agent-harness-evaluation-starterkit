@@ -109,6 +109,7 @@ $PYTHON evaluate/send_traffic.py --tag prod --endpoint PROD      # Online 结果
 
 # ⑥ 回流: 低分 -> bad case 候选 -> 复核 -> 新数据集版本; 根因与提示词建议
 $PYTHON feedback/mine_badcases.py --results "$(ls -t out/simulate-*.results.json | head -1)"
+$PYTHON feedback/mine_badcases.py --online-config <config-id> --hours 3      # Online 结果 (PROD)
 $PYTHON feedback/promote.py --reviewed feedback/reviewed/badcases-20261106-r1.jsonl   # 示例复核记录, 已在数据集里: 不发新版本
 ENDPOINT=STAGING SESSION_IDS="<sid> ..." bash feedback/failure_analysis.sh   # ENDPOINT = 这些会话所在的端点 (默认 PROD)
 HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
@@ -120,6 +121,7 @@ HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
   之后再提交会让 `release.sh` 的 `gate_key` 校验失败 (需要重跑 `deploy_staging.sh` + 门禁)。
 - 数据集发了新版本 (例如 `promote.py` 晋级了新的 bad case) 之后, 门禁会因为基线测在旧版本上而 BLOCKED,
   按上面 ④ 的前三行在 PROD 上重测基线。
+- clone 测试里还做了一次带代码改动的发布: 新 runtime version 2 -> STAGING -> 门禁 PASS -> PROD 1 -> 2, PROD 在部署过程中保持不变。
 - 可选部分没有在这次 clone 测试里重跑, 用法见下表和脚本头部注释: Config bundle A/B (`release/ab_test.sh`、`ab_ship.sh`)、
   金丝雀 (`release/canary_rule.yaml`)、AgentCore Policy (`release/policy.sh`)、流水线 (`release/ci/pipeline.yaml`、
   `github-actions.yml`, 两者都假定 kit 位于仓库根目录)。
