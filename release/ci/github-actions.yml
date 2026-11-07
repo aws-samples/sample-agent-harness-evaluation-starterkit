@@ -6,8 +6,9 @@
 #            as baggage), record the decision in SSM, upload the report
 #   release  push to main only, after `pr` passed: `environment: production` (Settings -> Environments ->
 #            production -> Required reviewers = the human approval), then release.sh moves PROD
+#            (required reviewers need a public repository or GitHub Team / Enterprise for private ones)
 # Repo settings: secrets AWS_DEPLOY_ROLE_ARN (STAGING deploy) + AWS_ROLE_ARN (gate) + AWS_RELEASE_ROLE_ARN (release),
-#                OIDC roles with the DeployRole / GateRole / ReleaseRole policies of pipeline.yaml, vars AWS_REGION,
+#                OIDC roles from release/ci/github-oidc-roles.yaml (stack outputs = the three secrets), vars AWS_REGION,
 #                AGENT_RUNTIME_ARN, GATEWAY_ID, BUNDLE_ID, BUNDLE_VERSION (optional: the Config bundle to gate + ship).
 # One STAGING endpoint is shared, so the gate job is serialized (concurrency group, never cancelled mid-run).
 name: agent-eval

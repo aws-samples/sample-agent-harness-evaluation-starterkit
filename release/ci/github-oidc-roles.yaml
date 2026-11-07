@@ -1,0 +1,243 @@
+# Step 4 Release - the three AWS roles release/ci/github-actions.yml assumes through GitHub OIDC (no access keys).
+# Same permissions as the CodeBuild roles in pipeline.yaml (DeployRole / GateRole / ReleaseRole), minus the
+# CodeBuild-only parts (build logs, artifact bucket, CodePipeline approval lookup):
+#   deploy   pr job, step "Deploy candidate to STAGING": CDK deploy via the bootstrap roles, STAGING only
+#   gate     pr job, gate + record: invoke / evaluate / read spans, write /<prefix>/gate/*; no deploy, no endpoints
+#   release  release job, only from the GitHub environment `production` (its required reviewers = the approval)
+# Deploy (once per account and repository):
+#   aws cloudformation deploy --stack-name evaldeck-github-oidc --template-file release/ci/github-oidc-roles.yaml \
+#     --capabilities CAPABILITY_IAM --parameter-overrides GitHubRepository=<org>/<repo> AgentRuntimeArn=<arn>
+#     [ExistingOidcProviderArn=<arn>]    # an account has at most one provider for token.actions.githubusercontent.com
+# Subject claim: repositories created since GitHub's immutable-subject change send
+#   repo:<owner>@<owner-id>/<repo>@<repo-id>:<context>   (GET /repos/<owner>/<repo>/actions/oidc/customization/sub)
+# instead of repo:<owner>/<repo>:<context>; the trust policies accept both.
+# Then set the repository secrets AWS_DEPLOY_ROLE_ARN / AWS_ROLE_ARN / AWS_RELEASE_ROLE_ARN from the stack outputs.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: evaldeck - GitHub Actions OIDC roles for the agent evaluation gate and release workflow
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: evaldeck
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  GitHubRepository:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    Description: owner/repository that runs release/ci/github-actions.yml
+  MainBranch:
+    Type: String
+    Default: main
+  AgentRuntimeArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[a-zA-Z0-9_-]+$"
+  ExistingOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: ARN of an existing token.actions.githubusercontent.com provider (empty = create one)
+Conditions:
+  CreateProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+
+  # ---------------------------------------------------------------- deploy: agentcore deploy + STAGING
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: {"token.actions.githubusercontent.com:aud": sts.amazonaws.com}
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubRepository}:pull_request"
+                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/${MainBranch}"
+                  - !Sub ["repo:${Owner}@*/${Repo}@*:pull_request", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+                  - !Sub ["repo:${Owner}@*/${Repo}@*:ref:refs/heads/${MainBranch}", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: deploy-staging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CdkDeployViaBootstrapRoles
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-hnb659fds-*"
+              - Sid: AgentcoreCliReadsTheStacks
+                Effect: Allow
+                Action: [cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:DescribeStackResources, cloudformation:GetTemplate]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/AgentCore-${NamePrefix}-*"
+                  - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*"
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*"
+              - Sid: AgentcoreCliTransactionSearchCheck
+                Effect: Allow
+                Action: [xray:GetTraceSegmentDestination, xray:GetIndexingRules, logs:DescribeResourcePolicies]
+                Resource: "*"
+              - Sid: ReadRuntimeAndEndpoints
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimeVersions
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/*"]
+              - Sid: MoveStagingOnly
+                Effect: Allow
+                Action: bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/STAGING"]
+              - Sid: BundleVersionForStagingRecord
+                Effect: Allow
+                Action: bedrock-agentcore:GetConfigurationBundleVersion
+                Resource: "*"
+              - Sid: NeverTouchProdOrDefault
+                Effect: Deny
+                Action: [bedrock-agentcore:UpdateAgentRuntimeEndpoint, bedrock-agentcore:DeleteAgentRuntimeEndpoint]
+                Resource:
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/PROD"
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/DEFAULT"
+
+  # ---------------------------------------------------------------- gate: evaluate STAGING + record (no deploy)
+  GateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: {"token.actions.githubusercontent.com:aud": sts.amazonaws.com}
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubRepository}:pull_request"
+                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/${MainBranch}"
+                  - !Sub ["repo:${Owner}@*/${Repo}@*:pull_request", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+                  - !Sub ["repo:${Owner}@*/${Repo}@*:ref:refs/heads/${MainBranch}", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: gate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadAndInvokeRuntime
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimeEndpoints
+                  - bedrock-agentcore:GetAgentRuntimeEndpoint
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/*"]
+              - Sid: EvaluateDatasetsBundles
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:Evaluate
+                  - bedrock-agentcore:ListEvaluators
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:GetDataset
+                  - bedrock-agentcore:ListDatasetExamples
+                  - bedrock-agentcore:ListDatasetVersions
+                  - bedrock-agentcore:GetConfigurationBundleVersion
+                Resource: "*"
+              - Sid: SpansForEvaluation
+                Effect: Allow
+                Action: [logs:StartQuery, logs:FilterLogEvents, logs:GetLogEvents]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+              - Effect: Allow
+                Action: [logs:GetQueryResults, logs:StopQuery]
+                Resource: "*"
+              - Sid: JudgesCustomDerivedAndSimulatedUser
+                Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Sid: CodeEvaluatorLambda
+                Effect: Allow
+                Action: [lambda:InvokeFunction, lambda:GetFunction]
+                Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${NamePrefix}-*"
+              - Sid: GateRecord
+                Effect: Allow
+                Action: [ssm:PutParameter, ssm:AddTagsToResource, ssm:GetParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/gate/*"
+              - Sid: NoEndpointChangesNoDeploy
+                Effect: Deny
+                Action:
+                  - bedrock-agentcore:UpdateAgentRuntimeEndpoint
+                  - bedrock-agentcore:DeleteAgentRuntimeEndpoint
+                  - bedrock-agentcore:CreateAgentRuntimeEndpoint
+                  - bedrock-agentcore:UpdateAgentRuntime
+                  - bedrock-agentcore:DeleteAgentRuntime
+                Resource: "*"
+              - Sid: NoCdkDeploy
+                Effect: Deny
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-*"
+
+  # ---------------------------------------------------------------- release: PROD + bundle pin + release records
+  ReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: {"token.actions.githubusercontent.com:aud": sts.amazonaws.com}
+              StringLike:
+                "token.actions.githubusercontent.com:sub":
+                  - !Sub "repo:${GitHubRepository}:environment:production"
+                  - !Sub ["repo:${Owner}@*/${Repo}@*:environment:production", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: release
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadGateRecordWriteReleaseRecord
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/*"
+              - Effect: Allow
+                Action: [ssm:PutParameter, ssm:AddTagsToResource]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
+              - Sid: MoveProdOnly
+                Effect: Allow
+                Action: [bedrock-agentcore:GetAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint]
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/PROD"]
+              - Sid: PinBundleOnGateway
+                Effect: Allow
+                Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:CreateGatewayRule, bedrock-agentcore:UpdateGatewayRule]
+                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+Outputs:
+  DeployRoleArn:
+    Description: repository secret AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn
+  GateRoleArn:
+    Description: repository secret AWS_ROLE_ARN
+    Value: !GetAtt GateRole.Arn
+  ReleaseRoleArn:
+    Description: repository secret AWS_RELEASE_ROLE_ARN
+    Value: !GetAtt ReleaseRole.Arn
