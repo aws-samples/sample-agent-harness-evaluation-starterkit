@@ -183,6 +183,11 @@ HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
 
 ## Things the run taught (also in the script headers)
 
+- Clone run (2026-11-07): a dataset created from a file stores `0.0` as `0`, so a plain string comparison saw a
+  change and `promote.py` published an identical version 2 (the gate then blocks on the baseline's dataset version);
+  `publish_dataset.py` now compares integral floats as ints.
+- Clone run: `failure_analysis.sh` looks up `SESSION_IDS` on `ENDPOINT` (default PROD); STAGING sessions on PROD fail
+  every session, and the script now exits 1 with the job's `errorDetails`.
 - Wait for ingestion: scoring a session ~40 s after it ended scored half a conversation silently
   (`run_ondemand.py` now refuses sessions younger than 5 min and flags `PartialSession`).
 - The dataset runner applies every evaluator to every row: rows without `expected_trajectory` return
