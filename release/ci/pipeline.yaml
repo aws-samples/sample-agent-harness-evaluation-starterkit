@@ -67,11 +67,65 @@ Conditions:
   UseS3: !Equals [!Ref SourceType, S3]
   UseConnection: !Equals [!Ref SourceType, CodeConnections]
 Resources:
+  # ---------------------------------------------------------------- buckets: access logs, artifacts, source
+  AccessLogBucket:                                     # S3 server access logs of the two buckets below
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: this is the access-log target bucket; logging it into itself would loop
+    Properties:
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      VersioningConfiguration: {Status: Enabled}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3ServerAccessLogs
+            Effect: Allow
+            Principal: {Service: logging.s3.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogBucket.Arn}/*"
+            Condition:
+              StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt AccessLogBucket.Arn, !Sub "${AccessLogBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
   ArtifactBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
+      VersioningConfiguration: {Status: Enabled}
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: artifact-bucket/
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
@@ -85,7 +139,22 @@ Resources:
           - Id: expire-artifacts
             Status: Enabled
             ExpirationInDays: 90
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
       Tags: [{Key: project, Value: !Ref NamePrefix}]
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt ArtifactBucket.Arn, !Sub "${ArtifactBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
   SourceBucket:
     Type: AWS::S3::Bucket
     Condition: UseS3
@@ -93,6 +162,9 @@ Resources:
     UpdateReplacePolicy: Retain
     Properties:
       VersioningConfiguration: {Status: Enabled}          # required by the S3 source action
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: source-bucket/
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
@@ -101,7 +173,27 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-source-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
       Tags: [{Key: project, Value: !Ref NamePrefix}]
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: UseS3
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt SourceBucket.Arn, !Sub "${SourceBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
 
   # ---------------------------------------------------------------- DeployStaging: agentcore deploy + STAGING
   DeployRole:
@@ -451,3 +543,5 @@ Outputs:
     Value: !Ref SourceBucket
   ArtifactBucket:
     Value: !Ref ArtifactBucket
+  AccessLogBucket:
+    Value: !Ref AccessLogBucket

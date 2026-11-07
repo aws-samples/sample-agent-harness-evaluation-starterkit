@@ -1,0 +1,148 @@
+# Step 4 Release / 5 Observe - deploy release/rollback_lambda.py: CloudWatch alarm -> EventBridge -> Lambda -> PROD back
+# to /<prefix>/release/previous. The alarms come from observe/alarms.yaml (names <prefix>-<agent>-<kind>); only
+# redline / goal-score alarms roll back, eval-silent notifies only (see the handler's docstring).
+# Deploy with release/deploy_rollback.sh (zips the handler, uploads it, deploys this stack). DryRun=true first: the
+# function logs its decision and changes nothing; switch to DryRun=false once the logged decisions look right.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: evaldeck - automatic rollback of the PROD endpoint on red-line / goal-score alarms
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: evaldeck
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  AgentRuntimeArn:
+    Type: String
+    AllowedPattern: "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[a-zA-Z0-9_-]+$"
+  EndpointName:
+    Type: String
+    Default: PROD
+  GatewayId:
+    Type: String
+    Default: ""
+    Description: front-door gateway id; set it to also move the Config bundle ship rule back (empty = endpoint only)
+  AbTestId:
+    Type: String
+    Default: ""
+    Description: running A/B test to pause instead of rolling back (empty = none)
+  DryRun:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  CodeS3Bucket:
+    Type: String
+  CodeS3Key:
+    Type: String
+Conditions:
+  HasGateway: !Not [!Equals [!Ref GatewayId, ""]]
+  HasAbTest: !Not [!Equals [!Ref AbTestId, ""]]
+Resources:
+  DeadLetterQueue:                                     # failed asynchronous invocations (after the Lambda retries)
+    Type: AWS::SQS::Queue
+    Properties:
+      KmsMasterKeyId: alias/aws/sqs                    # AWS managed key, nothing to manage
+      MessageRetentionPeriod: 1209600
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: rollback
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${NamePrefix}-rollback:*"
+              - Sid: XRay
+                Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+              - Sid: DeadLetters
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Sid: MoveProdOnly
+                Effect: Allow
+                Action: [bedrock-agentcore:GetAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint]
+                Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/${EndpointName}"]
+              - Sid: ReleaseRecords
+                Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
+              - !If
+                - HasGateway
+                - Sid: BundleShipRule
+                  Effect: Allow
+                  Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:UpdateGatewayRule]
+                  Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${GatewayId}"
+                - !Ref AWS::NoValue
+              - !If
+                - HasAbTest
+                - Sid: PauseAbTest
+                  Effect: Allow
+                  Action: [bedrock-agentcore:GetABTest, bedrock-agentcore:UpdateABTest]
+                  Resource: "*"
+                - !Ref AWS::NoValue
+  Function:
+    Type: AWS::Lambda::Function
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: calls only AWS service APIs (AgentCore control plane, SSM); no VPC resources to reach
+          - id: CKV_AWS_173
+            comment: environment holds ids and flags only (no secrets); encrypted at rest with the AWS managed key
+    Properties:
+      FunctionName: !Sub "${NamePrefix}-rollback"
+      Description: !Sub "${NamePrefix} - PROD back to the previous release on a red-line / goal-score alarm"
+      Runtime: python3.13
+      Handler: rollback_lambda.handler
+      Code: {S3Bucket: !Ref CodeS3Bucket, S3Key: !Ref CodeS3Key}
+      Role: !GetAtt FunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      ReservedConcurrentExecutions: 1                  # one rollback at a time
+      DeadLetterConfig: {TargetArn: !GetAtt DeadLetterQueue.Arn}
+      TracingConfig: {Mode: Active}
+      Environment:
+        Variables:
+          NAME_PREFIX: !Ref NamePrefix
+          AGENT_RUNTIME_ID: !Select [1, !Split ["runtime/", !Ref AgentRuntimeArn]]
+          ENDPOINT_NAME: !Ref EndpointName
+          GATEWAY_ID: !Ref GatewayId
+          AB_TEST_ID: !Ref AbTestId
+          DRY_RUN: !Ref DryRun
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+  AlarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub "${NamePrefix} alarms entering ALARM -> rollback Lambda"
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        detail:
+          alarmName: [{prefix: !Sub "${NamePrefix}-"}]
+          state: {value: [ALARM]}
+      Targets:
+        - Id: rollback
+          Arn: !GetAtt Function.Arn
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmRule.Arn
+Outputs:
+  FunctionName:
+    Value: !Ref Function
+  RuleName:
+    Value: !Ref AlarmRule
