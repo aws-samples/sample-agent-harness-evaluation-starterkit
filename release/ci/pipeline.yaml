@@ -17,6 +17,9 @@
 #     BundleId=<bundle-id> BundleVersion=<version-id>          # SourceType=CodeConnections ConnectionArn=... FullRepositoryId=org/repo
 #   (S3 source) cd <starter-kit-root-directory> && git archive -o /tmp/kit.zip HEAD && \
 #     aws s3 cp /tmp/kit.zip s3://<SourceBucket output>/evaldeck-kit.zip
+#   then: aws codepipeline start-pipeline-execution --name <prefix>-release   (the S3 source does not poll:
+#   PollForSourceChanges false and no EventBridge rule; the CodeConnections source triggers on push)
+#   BundleId / BundleVersion are optional: empty = the gate scores the code default prompt
 AWSTemplateFormatVersion: "2010-09-09"
 Description: evaldeck - agent evaluation gate and release pipeline (CodePipeline V2)
 Parameters:
