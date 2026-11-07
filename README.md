@@ -122,9 +122,44 @@ HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
 - 数据集发了新版本 (例如 `promote.py` 晋级了新的 bad case) 之后, 门禁会因为基线测在旧版本上而 BLOCKED,
   按上面 ④ 的前三行在 PROD 上重测基线。
 - clone 测试里还做了一次带代码改动的发布: 新 runtime version 2 -> STAGING -> 门禁 PASS -> PROD 1 -> 2, PROD 在部署过程中保持不变。
-- 可选部分没有在这次 clone 测试里重跑, 用法见下表和脚本头部注释: Config bundle A/B (`release/ab_test.sh`、`ab_ship.sh`)、
-  金丝雀 (`release/canary_rule.yaml`)、AgentCore Policy (`release/policy.sh`)、流水线 (`release/ci/pipeline.yaml`、
-  `github-actions.yml`, 两者都假定 kit 位于仓库根目录)。
+- 门禁的 sim 段里 `evaldeck_ScopeJudge` 只观测不拦截 (`requirements.yaml` 的 `segment_tiers: {sim: observe}`):
+  模拟用户会故意反复追问, 判官把这些追问轮打 0.5, 4 轮的均值稳定在 0.75。GoalSuccessRate 和红线在 sim 段照常拦截。
+
+### 可选: A/B、金丝雀、AgentCore Policy、流水线 (2026-11-07 在同一个 clone 里都跑过)
+
+```bash
+# A/B: 当前提示词 (control) vs Recommendations 的候选 (treatment), 走前门 Gateway, Online 评估打分
+HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh            # -> out/recommended_prompt.txt
+TREATMENT_PROMPT_FILE=out/recommended_prompt.txt ONLINE_EVAL=<config-id> SESSIONS=12 bash release/ab_test.sh start
+AB_TEST=<ab-test-id> bash release/ab_test.sh results                     # 约 30 分钟后两组都有结果
+AB_TEST=<ab-test-id> bash release/ab_test.sh stop
+AB_TEST=<ab-test-id> bash release/ab_ship.sh ship                        # 样本不够 / 不显著 -> 保持 control, 不建规则
+bash release/ab_ship.sh show                                             # 演练可用 VARIANT=T1 强制钉住 treatment
+
+# 金丝雀: 前门 90 / 10 分给 PROD / STAGING 两个 target
+aws cloudformation deploy --stack-name evaldeck-canary --template-file release/canary_rule.yaml \
+    --parameter-overrides GatewayId=<gateway-id> Split=90/10              # 撤回: delete-stack
+
+# AgentCore Policy: 引擎先 LOG_ONLY 观测, 审计无误伤再 ENFORCE
+bash release/policy.sh setup && bash release/policy.sh observe
+# ... 走前门发一些流量, 等 5-10 分钟指标
+HOURS=1 bash release/policy.sh audit && bash release/policy.sh enforce
+
+# CodePipeline (S3 源): Source -> DeployStaging -> Gate -> 人工审批 -> Release
+aws cloudformation deploy --stack-name evaldeck-pipeline --template-file release/ci/pipeline.yaml \
+    --capabilities CAPABILITY_IAM --parameter-overrides AgentRuntimeArn=<runtime-arn> GatewayId=<gateway-id>
+git archive -o /tmp/kit.zip HEAD && aws s3 cp /tmp/kit.zip s3://<SourceBucket>/evaldeck-kit.zip
+aws codepipeline start-pipeline-execution --name evaldeck-release     # 审批: 控制台或 put-approval-result
+
+# GitHub Actions: 三个 OIDC 角色, 仓库 secrets / vars, production environment (required reviewers)
+aws cloudformation deploy --stack-name evaldeck-github-oidc --template-file release/ci/github-oidc-roles.yaml \
+    --capabilities CAPABILITY_IAM --parameter-overrides GitHubRepository=<owner>/<repo> AgentRuntimeArn=<runtime-arn>
+gh secret set AWS_DEPLOY_ROLE_ARN -b <DeployRoleArn>; gh secret set AWS_ROLE_ARN -b <GateRoleArn>
+gh secret set AWS_RELEASE_ROLE_ARN -b <ReleaseRoleArn>
+gh variable set AWS_REGION -b <region>; gh variable set AGENT_RUNTIME_ARN -b <runtime-arn>
+# Settings -> Environments -> production -> Required reviewers (私有仓库需要 GitHub Team / Enterprise)
+mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows/agent-eval.yml
+```
 
 ## Step -> files -> what it does -> verified
 
@@ -152,8 +187,9 @@ HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
 | ④ | `release/rollback_lambda.py`, `test_rollback_lambda.py` | alarm -> EventBridge -> Lambda: PROD (and bundle rule) back to `/release/previous`, once per release; A/B paused instead; eval-silent notifies only | ✅ v2: unit tests + live drill PROD 4 -> 3 from SSM previous, then re-release (handler run locally, not deployed) |
 | ④ | `release/harden_default.sh` | Deny resource policy on the DEFAULT endpoint ARN (merged into an existing policy), then invokes DEFAULT / STAGING / PROD | ✅ v2: DEFAULT AccessDenied, STAGING / PROD 200; kit scripts re-run on STAGING / PROD afterwards |
 | ④ | `release/ci/gate_step.sh` | the one gate step both CI systems call: gen_gate --check, pytest, acceptance + sim on STAGING with the bundle, gate.py | ✅ v2: ran locally (PASS) and in CodeBuild (PASS, gate_key `09343404ec438537`) |
-| ④ | `release/ci/github-actions.yml` | `pr` job (checkout, setup-python/node, OIDC with aws-region, install, deploy_staging with the deploy role, then the gate role for gate + record, artifact, PR comment; STAGING concurrency lock) + `release` job on main with `environment: production` | ⚠ actionlint clean (incl. shellcheck); not run on GitHub (no repo / OIDC role in the test account) |
-| ④ | `release/ci/buildspec-deploy.yml`, `buildspec.yml`, `buildspec-release.yml`, `pipeline.yaml` | CodePipeline V2 (QUEUED): Source (S3 or CodeConnections) -> DeployStaging (CodeBuild) -> Gate (CodeBuild) -> Manual approval (gate_key + versions + report link) -> Release (CodeBuild); one role per stage: only DeployRole deploys (STAGING only), GateRole cannot deploy or change any endpoint, only ReleaseRole moves PROD | ✅ v2: cfn-lint + validate-template + deployed (`evaldeck-pipeline`, S3 source = zip of the kit); one execution Source -> Gate (PASS) -> Approval (approved with `put-approval-result`) -> Release (PROD 4 -> 5). GitHub/CodeConnections source variant not run |
+| ④ | `release/ci/github-actions.yml` | `pr` job (checkout, setup-python/node, OIDC with aws-region, install, deploy_staging with the deploy role, then the gate role for gate + record, artifact, PR comment; STAGING concurrency lock) + `release` job on main with `environment: production` | ✅ 2026-11-07 clone: test repository, three OIDC roles from `github-oidc-roles.yaml`; PR -> gate BLOCKED + PR comment + SSM record; push to main -> gate PASS -> `production` approval -> PROD 2 -> 3 |
+| ④ | `release/ci/github-oidc-roles.yaml` | CloudFormation: GitHub OIDC provider (or an existing one) + deploy / gate / release roles with the pipeline.yaml permissions; trust accepts both `repo:<owner>/<repo>` and the immutable `repo:<owner>@<id>/<repo>@<id>` subject; release role only from environment `production` | ✅ 2026-11-07: cfn-lint + deployed; used by the GitHub Actions run |
+| ④ | `release/ci/buildspec-deploy.yml`, `buildspec.yml`, `buildspec-release.yml`, `pipeline.yaml` | CodePipeline V2 (QUEUED): Source (S3 or CodeConnections) -> DeployStaging (CodeBuild) -> Gate (CodeBuild) -> Manual approval (gate_key + versions + report link) -> Release (CodeBuild); one role per stage: only DeployRole deploys (STAGING only), GateRole cannot deploy or change any endpoint, only ReleaseRole moves PROD | ✅ v2: cfn-lint + validate-template + deployed (`evaldeck-pipeline`, S3 source = zip of the kit); one execution Source -> Gate (PASS) -> Approval (approved with `put-approval-result`) -> Release (PROD 4 -> 5). GitHub/CodeConnections source variant not run; 2026-11-07 clone (us-west-2, S3 source): Gate BLOCKED twice on the sim ScopeJudge -> `segment_tiers` -> Source -> DeployStaging -> Gate PASS -> Approval -> Release PROD 3 -> 5 |
 | ④ | `release/ab_test.sh` | config-bundle A/B through AgentCore Gateway (control = current prompt, treatment = candidate), results with p-value / CI, stop | ✅ ran on 2026-11-06 (12 sessions: mechanics only, no significance expected) |
 | ④ | `release/ab_ship.sh` | after `ab-test stop`: decide (significant on the primary, nothing significantly worse, min samples) -> static-override Gateway rule for the winner; `pin` / `restore` / `show` | ✅ v2: decision C (kept, no rule); forced T1 drill: rule pinned T1, spans showed T1's version, `restore` pinned the released bundle again |
 | ④ | `release/canary_rule.yaml` | CloudFormation `AWS::BedrockAgentCore::GatewayRule`: weighted route 90/10 between the PROD and STAGING targets | ✅ v2: cfn-lint + validate-template + deployed (`evaldeck-canary`); 20 sessions -> 13 PROD / 5 STAGING (2 not found in spans) |
