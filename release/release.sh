@@ -24,7 +24,7 @@ STAGING_FILE="${STAGING_FILE:-out/staging.json}"
 
 # 1. the key the gate decided on must match what we are about to release
 KEY=$("$PY" release/gate_key.py --staging "$STAGING_FILE" --check)
-read -r RUNTIME_ID VERSION BUNDLE_ARN BUNDLE_VERSION < <("$PY" -c "
+read -r RUNTIME_ID VERSION ST_BUNDLE_ARN ST_BUNDLE_VERSION < <("$PY" -c "
 import json; d = json.load(open('$STAGING_FILE'))
 print(d['runtimeId'], d['runtimeVersion'], d.get('bundleArn') or '-', d.get('bundleVersion') or '-')")
 
@@ -37,7 +37,7 @@ if [ "$VERDICT" != PASS ]; then
 fi
 OLD=$(aws bedrock-agentcore-control get-agent-runtime-endpoint --agent-runtime-id "$RUNTIME_ID" --endpoint-name PROD \
   --region "$REGION" --query liveVersion --output text)
-echo "{\"gate_key\": \"$KEY\", \"verdict\": \"$VERDICT\", \"prod\": \"$OLD -> $VERSION\", \"bundle\": \"$BUNDLE_VERSION\", \"approved_by\": \"$APPROVED_BY\"}"
+echo "{\"gate_key\": \"$KEY\", \"verdict\": \"$VERDICT\", \"prod\": \"$OLD -> $VERSION\", \"bundle\": \"$ST_BUNDLE_VERSION\", \"approved_by\": \"$APPROVED_BY\"}"
 [ "${DRY_RUN:-0}" = "1" ] && { echo "DRY_RUN: no change"; exit 0; }
 
 # 3. PROD -> tested runtime version
@@ -52,8 +52,8 @@ done
 [ "$LIVE" = "$VERSION" ] || { echo "PROD did not reach $VERSION (live $LIVE, $STATUS)" >&2; exit 1; }
 
 # 4. tested bundle -> front-door Gateway
-if [ "$BUNDLE_VERSION" != "-" ] && [ "${PIN_BUNDLE:-1}" = "1" ]; then
-  bash release/ab_ship.sh pin "$BUNDLE_ARN" "$BUNDLE_VERSION"
+if [ "$ST_BUNDLE_VERSION" != "-" ] && [ "${PIN_BUNDLE:-1}" = "1" ]; then
+  bash release/ab_ship.sh pin "$ST_BUNDLE_ARN" "$ST_BUNDLE_VERSION"
 fi
 
 # 5. release records: previous <- current, current <- this release

@@ -19,11 +19,16 @@ STAGING_FILE="${STAGING_FILE:-out/staging.json}"
 "$PY" define/gen_gate.py --check
 "$PY" -m pytest -q define/evaluators/code_eval release
 
-read -r DATASET_VERSION BUNDLE_ID BUNDLE_VERSION < <("$PY" -c "
+# local names: BUNDLE_ID / BUNDLE_VERSION are exported (possibly empty) in CI and read by the Python scripts
+read -r DATASET_VERSION ST_BUNDLE_ID ST_BUNDLE_VERSION < <("$PY" -c "
 import json; d = json.load(open('$STAGING_FILE'))
 print(d['datasetVersion'], (d.get('bundleArn') or '-').rsplit('/', 1)[-1], d.get('bundleVersion') or '-')")
 TARGET=(--endpoint STAGING)
-[ "$BUNDLE_VERSION" != "-" ] && TARGET+=(--bundle "$BUNDLE_ID" --bundle-version "$BUNDLE_VERSION")
+if [ "$ST_BUNDLE_VERSION" != "-" ]; then
+  TARGET+=(--bundle "$ST_BUNDLE_ID" --bundle-version "$ST_BUNDLE_VERSION")
+else
+  unset BUNDLE_ID BUNDLE_VERSION       # the gate scores the code default prompt, as staging.json says
+fi
 if [ -z "${RESULTS:-}" ]; then
   "$PY" evaluate/run_dataset.py --mode ondemand --segment acceptance --dataset-version "$DATASET_VERSION" "${TARGET[@]}"
   RESULTS=$(ls -t out/dataset-ondemand-*.results.json | head -1)
