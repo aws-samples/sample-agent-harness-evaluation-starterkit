@@ -57,5 +57,7 @@ print(json.dumps({"status": r["status"], "errorCode": res.get("errorCode"), "err
 if res.get("recommendedSystemPrompt"):
     print("\n--- explanation\n" + (res.get("explanation") or ""))
     print("\n--- recommended system prompt\n" + res["recommendedSystemPrompt"])
+    open("out/recommended_prompt.txt", "w").write(res["recommendedSystemPrompt"])
+    print("\nwritten: out/recommended_prompt.txt (TREATMENT_PROMPT_FILE for release/ab_test.sh)")
 PY
 echo "full result: out/${NAME}.json"
