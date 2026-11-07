@@ -186,6 +186,9 @@ HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
 - Clone run (2026-11-07): a dataset created from a file stores `0.0` as `0`, so a plain string comparison saw a
   change and `promote.py` published an identical version 2 (the gate then blocks on the baseline's dataset version);
   `publish_dataset.py` now compares integral floats as ints.
+- Clone run: `mine_badcases.py --online-config` looked for spans on STAGING while the online config scores PROD, so
+  the flagged session was dropped silently; it now reads the endpoint of each result (`--endpoint`, default PROD,
+  for online results) and lists sessions without spans.
 - Clone run: `failure_analysis.sh` looks up `SESSION_IDS` on `ENDPOINT` (default PROD); STAGING sessions on PROD fail
   every session, and the script now exits 1 with the job's `errorDetails`.
 - Wait for ingestion: scoring a session ~40 s after it ended scored half a conversation silently
