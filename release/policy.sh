@@ -52,8 +52,19 @@ def set_mode(mode):
             "authorizerConfiguration", "kmsKeyArn", "customTransformConfiguration", "interceptorConfigurations",
             "exceptionLevel", "wafConfiguration")
     args = {k: gw[k] for k in keep if gw.get(k) not in (None, {}, [])}
-    r = ctl.update_gateway(gatewayIdentifier=gw_id, policyEngineConfiguration={"arn": e["policyEngineArn"], "mode": mode},
-                           **args)
+    # the Gateway role's grant from `setup` (IAM) takes a while to propagate: UpdateGateway then fails with
+    # "Access denied while calling GetPolicyEngine ... with Gateway role" - retry for up to ~3 minutes
+    for attempt in range(12):
+        try:
+            ctl.update_gateway(gatewayIdentifier=gw_id,
+                               policyEngineConfiguration={"arn": e["policyEngineArn"], "mode": mode}, **args)
+            break
+        except ctl.exceptions.ValidationException as err:
+            if "Access denied while calling GetPolicyEngine" not in str(err) or attempt == 11:
+                raise
+            print(f"Gateway role cannot read the engine yet (IAM propagation), retry {attempt + 1}/11 in 15 s",
+                  file=sys.stderr)
+            time.sleep(15)
     while (g := ctl.get_gateway(gatewayIdentifier=gw_id))["status"] in ("UPDATING", "CREATING"):
         time.sleep(3)
     print(json.dumps({"gateway": g["name"], "status": g["status"], "policyEngineConfiguration": {
