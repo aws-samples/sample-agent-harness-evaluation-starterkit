@@ -140,6 +140,12 @@ bash release/ab_ship.sh show                                             # 演�
 aws cloudformation deploy --stack-name evaldeck-canary --template-file release/canary_rule.yaml \
     --parameter-overrides GatewayId=<gateway-id> Split=90/10              # 撤回: delete-stack
 
+# 自动回滚: 告警 -> EventBridge -> Lambda -> PROD 回到 /<prefix>/release/previous (每次发布最多一次)
+DRY_RUN=true bash release/deploy_rollback.sh                     # 先只记录判定
+aws cloudwatch set-alarm-state --alarm-name evaldeck-shopagent-redline --state-value ALARM --state-reason drill
+aws logs tail /aws/lambda/evaldeck-rollback --since 10m          # {"event": "rollback-decision", ...}
+DRY_RUN=false bash release/deploy_rollback.sh                    # 确认判定正确后再打开
+
 # AgentCore Policy: 引擎先 LOG_ONLY 观测, 审计无误伤再 ENFORCE
 bash release/policy.sh setup && bash release/policy.sh observe
 # ... 走前门发一些流量, 等 5-10 分钟指标
@@ -184,7 +190,8 @@ mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows
 | ④ | `release/gate.py`, `release/baseline.json`, `release/waivers.yaml`, `test_gate.py` | PASS / BLOCKED per segment (`acceptance` = run_dataset, `sim` = simulate): thresholds, red line = 0, no regression (`max(tol, step/n)`), baseline per segment + dataset version, missing results / unverified bundle = blocked; waivers (gate metric only, floor, expiry, approver; red line refused) | ✅ v2: STAGING gate PASS (bundle verified 8/8 sessions); waiver applied + red-line waiver refused; 27 release unit tests |
 | ④ | `release/record.py` | gate decision -> SSM `/evaldeck/gate/<gate_key>` (latest decision wins) | ✅ v2: ran |
 | ④ | `release/release.sh` | needs PASS record for the recomputed gate_key + approver -> PROD -> tested version, bundle pinned on the Gateway -> `/evaldeck/release/current` + `/previous` | ✅ v2: PROD 3 -> 4 (local) and 4 -> 5 (pipeline Release stage, approver read from the Manual action); refused: no approver / tampered key / no record |
-| ④ | `release/rollback_lambda.py`, `test_rollback_lambda.py` | alarm -> EventBridge -> Lambda: PROD (and bundle rule) back to `/release/previous`, once per release; A/B paused instead; eval-silent notifies only | ✅ v2: unit tests + live drill PROD 4 -> 3 from SSM previous, then re-release (handler run locally, not deployed) |
+| ④ | `release/rollback_lambda.py`, `test_rollback_lambda.py` | alarm -> EventBridge -> Lambda: PROD (and bundle rule) back to `/release/previous`, once per release; A/B paused instead; eval-silent notifies only | ✅ v2: unit tests + local drill; 2026-11-07 clone: deployed with `rollback.yaml` (Lambda python3.13, EventBridge rule, DLQ): DRY_RUN logged `rollback 5 -> 3` and changed nothing; eval-silent -> notify-only; armed -> PROD 5 -> 3, records current v3 / previous null; second alarm -> no-previous-release |
+| ④ | `release/rollback.yaml`, `deploy_rollback.sh` | CloudFormation for the rollback Lambda: EventBridge rule on `<prefix>-*` alarms entering ALARM, least-privilege role (PROD endpoint, `/<prefix>/release/*`, optional ship rule / A/B test), SQS DLQ, reserved concurrency 1, X-Ray; `DRY_RUN=true` first | ✅ 2026-11-07: cfn-lint, checkov, deployed and drilled (row above) |
 | ④ | `release/harden_default.sh` | Deny resource policy on the DEFAULT endpoint ARN (merged into an existing policy), then invokes DEFAULT / STAGING / PROD | ✅ v2: DEFAULT AccessDenied, STAGING / PROD 200; kit scripts re-run on STAGING / PROD afterwards |
 | ④ | `release/ci/gate_step.sh` | the one gate step both CI systems call: gen_gate --check, pytest, acceptance + sim on STAGING with the bundle, gate.py | ✅ v2: ran locally (PASS) and in CodeBuild (PASS, gate_key `09343404ec438537`) |
 | ④ | `release/ci/github-actions.yml` | `pr` job (checkout, setup-python/node, OIDC with aws-region, install, deploy_staging with the deploy role, then the gate role for gate + record, artifact, PR comment; STAGING concurrency lock) + `release` job on main with `environment: production` | ✅ 2026-11-07 clone: test repository, three OIDC roles from `github-oidc-roles.yaml`; PR -> gate BLOCKED + PR comment + SSM record; push to main -> gate PASS -> `production` approval -> PROD 2 -> 3 |
@@ -221,6 +228,8 @@ mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows
 
 ## Things the run taught (also in the script headers)
 
+- Clone run (CodeConnections, 2026-11-08): a single 0.5 flip of ScopeJudge on n = 7 BLOCKED as a regression: means are
+  rounded to 4 decimals (0.9286 -> 0.8571 = 0.0715 > 0.5 / 7). `gate.py` now allows for the rounding (unit test added).
 - Clone run (2026-11-07): the sim segment BLOCKED in 3 of 3 runs (PR, CodePipeline, retry) on `evaldeck_ScopeJudge`
   0.75 < 0.8 over 4 turns: the pushy persona's follow-ups are scored 0.5 while the agent behaves as specified. The
   criterion now has `segment_tiers: {sim: observe}` (requirements.yaml -> gate.yaml): ScopeJudge gates the acceptance

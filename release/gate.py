@@ -154,6 +154,9 @@ def _waiver_for(waivers: dict, metric: str, segment: str) -> dict | None:
 
 
 # ---------------------------------------------------------------- decision
+ROUNDING = 1.1e-4   # two 4-decimal roundings (mean and baseline mean)
+
+
 def decide(gate: dict, metrics: dict, dataset: dict | None, baseline: dict | None,
            problems: list[str], waivers: dict | None = None, segment: str = PRIMARY,
            only: set[str] | None = None) -> dict:
@@ -209,7 +212,9 @@ def decide(gate: dict, metrics: dict, dataset: dict | None, baseline: dict | Non
             elif base is not None and mean is not None:
                 allowed = max(tol, (spec.get("score_step") or 0.0) / n) if n else tol
                 row["tolerance"] = round(allowed, 4)
-                if base - mean > allowed + 1e-9:
+                # means (and stored baselines) are rounded to 4 decimals: allow for that rounding, so one flip of
+                # score_step on n results (e.g. 0.9286 -> 0.8571 at n = 7, step 0.5) is not a regression
+                if base - mean > allowed + ROUNDING:
                     row["why"].append(f"regressed {base} -> {mean} (> {allowed:.3f} tolerance)")
         if row["why"]:
             row["status"] = "BLOCKED" if enforce else "WARN"

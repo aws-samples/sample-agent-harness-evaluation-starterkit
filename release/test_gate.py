@@ -76,6 +76,16 @@ def test_one_step_flip_is_tolerated_two_are_not():
     assert g.decide(gate, m(gsr=ten[:8] + (0.0, 0.0)), DS, base, [])["decision"] == "BLOCKED"     # 2 of 10
 
 
+def test_one_step_flip_survives_4_decimal_rounding():
+    # clone run 2026-11-07: baseline 6.5 / 7 stored as 0.9286, candidate 6 / 7 = 0.8571, step 0.5 -> tolerance 0.5 / 7
+    gate = {**GATE, "metrics": [{**GATE["metrics"][0], "score_step": 0.5}] + GATE["metrics"][1:]}
+    base = {**BASE, "metrics": {**BASE["metrics"], "Builtin.GoalSuccessRate": {"mean": 0.9286}}}
+    one_flip = (1.0,) * 5 + (0.5, 0.5)                     # 6 / 7 = 0.8571: one more 0.5 than the baseline
+    two_flips = (1.0,) * 4 + (0.5, 0.5, 0.5)               # 5.5 / 7 = 0.7857
+    assert g.decide(gate, m(gsr=one_flip), DS, base, [])["decision"] == "PASS"
+    assert g.decide(gate, m(gsr=two_flips), DS, base, [])["decision"] == "BLOCKED"
+
+
 # ---------------------------------------------------------------- segments, bundle check, waivers
 import json  # noqa: E402
 from datetime import date  # noqa: E402
