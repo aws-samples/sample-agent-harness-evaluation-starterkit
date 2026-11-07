@@ -14,7 +14,7 @@ turns[].expected_response and assertions), judge_error (goes to the judge-regres
 dataset) or reject. Then feedback/promote.py.
 
 Usage:
-  python feedback/mine_badcases.py --online-config <config-id> [--hours 6]      # online evaluation results
+  python feedback/mine_badcases.py --online-config <config-id> [--hours 6] [--endpoint PROD]   # online results
   python feedback/mine_badcases.py --results out/simulate-<ts>.results.json    # any evaldeck results file(s)
 Writes out/badcases-<ts>.jsonl.
 """
@@ -107,23 +107,33 @@ def main() -> int:
     ap.add_argument("--results", type=Path, action="append", default=[])
     ap.add_argument("--hours", type=int, default=6)
     ap.add_argument("--max", type=int, default=20)
+    ap.add_argument("--endpoint", choices=kit.ENDPOINTS, default="PROD",
+                    help="endpoint the online config evaluates (default PROD); results files carry their own")
     a = ap.parse_args()
     gate = yaml.safe_load((kit.KIT / "define/gate.yaml").read_text())
     items, source = [], []
     if a.online_config:
-        items += online_items(a.online_config, a.hours)
+        items += [{**i, "endpoint": a.endpoint} for i in online_items(a.online_config, a.hours)]
         source.append(f"online:{a.online_config}")
     for p in a.results:
-        items += json.loads(p.read_text())["items"]
+        doc = json.loads(p.read_text())
+        ep = (doc.get("agent") or {}).get("endpoint") or doc.get("endpoint") or kit.ENDPOINT
+        items += [{**i, "endpoint": ep} for i in doc["items"]]
         source.append(p.name)
     by_session: dict[str, list[dict]] = defaultdict(list)
     for b in pick(items, gate):
         by_session[b["session_id"]].append(b)
-    collector = CloudWatchAgentSpanCollector(log_group_name=kit.runtime_log_group(), region=kit.REGION)
-    day, rows = kit.now_utc().strftime("%Y%m%d"), []
+    # spans live in the log group of the endpoint the session ran on (PROD for online, the run's endpoint for files)
+    collectors = {}
+    day, rows, no_spans = kit.now_utc().strftime("%Y%m%d"), [], []
     for sid, flags in list(by_session.items())[: a.max]:
-        turns = conversation(collector, sid, a.hours)
+        ep = flags[0]["endpoint"]
+        if ep not in collectors:
+            collectors[ep] = CloudWatchAgentSpanCollector(log_group_name=kit.runtime_log_group(endpoint=ep),
+                                                          region=kit.REGION)
+        turns = conversation(collectors[ep], sid, a.hours)
         if not turns:
+            no_spans.append(sid)
             continue
         worst = flags[0]
         rows.append({
@@ -144,7 +154,7 @@ def main() -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
     print(json.dumps({"scored_results": len(items), "flagged_sessions": len(by_session), "candidates": len(rows),
-                      "file": str(path)}))
+                      "no_spans": no_spans, "file": str(path)}))
     for r in rows:
         f = r["metadata"]["lineage"]["flags"][0]
         print(f"  {r['scenario_id']} <- {r['metadata']['lineage']['origin_session_id'][:48]} {f['evaluator']}={f['value']} ({f['kind']})")
