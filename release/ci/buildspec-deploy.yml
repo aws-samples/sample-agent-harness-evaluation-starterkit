@@ -13,7 +13,6 @@ phases:
       python: 3.12
       nodejs: 22
     commands:
-      - cd starter-kit
       - pip install -q -r requirements.txt uv            # uv: agentcore packages the CodeZip runtime with it
       - npm i -g @aws/agentcore@1.0.1 >/dev/null
       - (cd agent/evaldeck/agentcore/cdk && npm ci --no-audit --no-fund >/dev/null)
@@ -22,6 +21,6 @@ phases:
       - export GIT_COMMIT="${GIT_COMMIT:-$CODEBUILD_RESOLVED_SOURCE_VERSION}"
       - bash release/deploy_staging.sh
 artifacts:
-  base-directory: starter-kit/out
+  base-directory: out
   files:
     - staging.json

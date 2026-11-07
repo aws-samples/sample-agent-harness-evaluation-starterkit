@@ -1,5 +1,5 @@
 # Step 4 Release - CodePipeline V2: Source -> DeployStaging -> Gate -> Approval (Manual) -> Release.
-#   Source         S3 object (a zip of the repo with starter-kit/ at its root) or CodeConnections (GitHub, GitLab, ...)
+#   Source         S3 object (a zip of the kit, its root = the repository root) or CodeConnections (GitHub, GitLab, ...)
 #   DeployStaging  release/ci/buildspec-deploy.yml: deploy_staging.sh (agentcore deploy, STAGING -> new version,
 #                  PROD-unchanged check) -> staging.json. DeployRole: CDK deploy + STAGING only, PROD / DEFAULT denied
 #   Gate           release/ci/buildspec.yml: gate_step.sh (acceptance + sim on STAGING) -> record.py. GateRole cannot
@@ -15,8 +15,8 @@
 #   aws cloudformation deploy --stack-name evaldeck-pipeline --template-file release/ci/pipeline.yaml \
 #     --capabilities CAPABILITY_IAM --parameter-overrides AgentRuntimeArn=<arn> GatewayId=<id> \
 #     BundleId=<bundle-id> BundleVersion=<version-id>          # SourceType=CodeConnections ConnectionArn=... FullRepositoryId=org/repo
-#   (S3 source) cd <repo> && zip -r kit.zip starter-kit -x '*/.venv/*' '*/node_modules/*' '*/out/*' && \
-#     aws s3 cp kit.zip s3://<SourceBucket output>/evaldeck-kit.zip
+#   (S3 source) cd <starter-kit-root-directory> && git archive -o /tmp/kit.zip HEAD && \
+#     aws s3 cp /tmp/kit.zip s3://<SourceBucket output>/evaldeck-kit.zip
 AWSTemplateFormatVersion: "2010-09-09"
 Description: evaldeck - agent evaluation gate and release pipeline (CodePipeline V2)
 Parameters:
@@ -172,7 +172,7 @@ Resources:
       Name: !Sub "${NamePrefix}-deploy-staging"
       ServiceRole: !GetAtt DeployRole.Arn
       TimeoutInMinutes: 30
-      Source: {Type: CODEPIPELINE, BuildSpec: starter-kit/release/ci/buildspec-deploy.yml}
+      Source: {Type: CODEPIPELINE, BuildSpec: release/ci/buildspec-deploy.yml}
       Artifacts: {Type: CODEPIPELINE}
       Environment:
         Type: LINUX_CONTAINER
@@ -272,7 +272,7 @@ Resources:
       Name: !Sub "${NamePrefix}-gate"
       ServiceRole: !GetAtt GateRole.Arn
       TimeoutInMinutes: 60
-      Source: {Type: CODEPIPELINE, BuildSpec: starter-kit/release/ci/buildspec.yml}
+      Source: {Type: CODEPIPELINE, BuildSpec: release/ci/buildspec.yml}
       Artifacts: {Type: CODEPIPELINE}
       Environment:
         Type: LINUX_CONTAINER
@@ -336,7 +336,7 @@ Resources:
       Name: !Sub "${NamePrefix}-release"
       ServiceRole: !GetAtt ReleaseRole.Arn
       TimeoutInMinutes: 20
-      Source: {Type: CODEPIPELINE, BuildSpec: starter-kit/release/ci/buildspec-release.yml}
+      Source: {Type: CODEPIPELINE, BuildSpec: release/ci/buildspec-release.yml}
       Artifacts: {Type: CODEPIPELINE}
       Environment:
         Type: LINUX_CONTAINER

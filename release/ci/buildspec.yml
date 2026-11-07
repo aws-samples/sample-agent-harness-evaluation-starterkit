@@ -21,7 +21,6 @@ phases:
     runtime-versions:
       python: 3.12
     commands:
-      - cd starter-kit
       - pip install -q -r requirements.txt
   build:
     commands:
@@ -38,7 +37,7 @@ phases:
       - test -n "${REPORT_BUCKET:-}" && test -f out/gate-report.json && aws s3 cp out/gate-report.json "s3://$REPORT_BUCKET/gates/$GATE_KEY/gate-report.json" --only-show-errors || true
       - echo "gate=$GATE_DECISION key=$GATE_KEY runtime=$RUNTIME_VERSION bundle=$BUNDLE_VERSION dataset=$DATASET_VERSION"
 artifacts:
-  base-directory: starter-kit/out
+  base-directory: out
   files:
     - staging.json
     - gate-report.json

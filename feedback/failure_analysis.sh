@@ -9,7 +9,8 @@
 # Prerequisites: AgentCore CLI 1.0.x; caller credentials need StartBatchEvaluation/GetBatchEvaluation and
 # logs read on the runtime log group (no service role is used for batch).
 # Usage:
-#   SESSION_IDS="sid1 sid2" bash feedback/failure_analysis.sh          # specific sessions (e.g. mined bad cases)
+#   SESSION_IDS="sid1 sid2" bash feedback/failure_analysis.sh          # specific sessions (e.g. mined bad cases);
+#                                                    ENDPOINT=STAGING when they ran on STAGING (default PROD)
 #   HOURS=24 bash feedback/failure_analysis.sh                         # every session of the last N hours (<=500)
 #   ONLINE_EVAL=<config-id> HOURS=24 bash feedback/failure_analysis.sh # sessions an online config sampled
 set -euo pipefail
@@ -56,3 +57,8 @@ for ins in job.get("insightResults") or []:
                 print(f"    - {s.get('sessionId')} {f.get('targetType')}={f.get('targetId')} [{f.get('category')}] {f.get('description')}")
 PY
 echo "full job: out/${NAME}.json"
+if [ "$STATUS" = FAILED ] || [ "$STATUS" = STOPPED ]; then
+  # most common cause: the sessions were sent to another endpoint (SESSION_IDS from STAGING -> set ENDPOINT=STAGING)
+  echo "batch evaluation $STATUS on endpoint ${ENDPOINT:-PROD}: $("$PY" -c "import json; print(json.load(open('out/${NAME}.json')).get('errorDetails'))")" >&2
+  exit 1
+fi

@@ -46,10 +46,14 @@ starter-kit 相对 lifecycle 新增或改进的:
 
 ```bash
 npm i -g @aws/agentcore                                  # AgentCore CLI 1.0.x, Node >= 20.12
-python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+uv venv --python 3.12 .venv && uv pip install -p .venv -r requirements.txt   # or: python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+(cd agent/evaldeck/agentcore/cdk && npm ci)              # CDK app dependencies (node_modules is not committed)
 export AWS_PROFILE=<profile> AWS_REGION=us-east-1        # nothing in the kit hard-codes an account, profile or region
 export PYTHON=.venv/bin/python                           # used by the .sh scripts
 ```
+Tools: Node.js >= 20.12, [uv](https://docs.astral.sh/uv/) (local venv; `agentcore create` also checks for it), AWS CLI v2, `zip`.
+Keep `NAME_PREFIX` at `evaldeck` unless you also rename the project in `agent/evaldeck` and the evaluator names in
+`define/requirements.yaml` / `define/gen_gate.py`.
 Prerequisites in the account: Bedrock model access (the kit uses Claude Haiku 4.5 for agent, judges and the simulated
 user), CloudWatch Transaction Search (`agentcore deploy` enables it). Optional env: `AGENT_RUNTIME_ARN` (else read
 from `agentcore status`), `AGENT_ENDPOINT` (`DEFAULT` | `STAGING` | `PROD`, default `STAGING`; also `--endpoint`),
@@ -57,6 +61,68 @@ from `agentcore status`), `AGENT_ENDPOINT` (`DEFAULT` | `STAGING` | `PROD`, defa
 `GATEWAY_ID`, `NAME_PREFIX` (default `evaldeck`), `EVAL_OUT` (`out/`), `EVAL_CONCURRENCY` (macOS: `1`, see below).
 Every script writes its results to `out/` in one normalized format (`evaldeck.results/v1`) that `release/gate.py` and
 `feedback/mine_badcases.py` read.
+
+## 从零运行 (clone 之后)
+
+一个干净的 clone 不带任何账号状态: `define/datasets/registry.json` 是 `{}`, 没有 `release/baseline.json`,
+`release/waivers.yaml` 为空; 这些都由下面的命令在你的账号里生成。参考运行留下的同名文件在
+`examples/reference-run-20261106/`, 只供阅读。以下顺序在 2026-11-07 用一个全新的 clone 在另一个区域 (us-west-2)
+从头跑过一遍 (先完成上面的 Setup):
+
+```bash
+# ① 定义: 门禁配置、数据集 v1、三个自定义评估器
+$PYTHON define/gen_gate.py --check
+$PYTHON define/datasets/publish_dataset.py                 # -> registry.json (dataset id + version 1)
+$PYTHON define/evaluators/register_evaluators.py           # ScopeJudge (LLM judge) + TaskCompletionOwnModel (derived)
+bash define/evaluators/code_eval/deploy.sh                 # RedlineCode (Lambda)
+git add define/datasets/registry.json && git commit -m "dataset v1"
+
+# ② 构建: 部署 Agent (首次部署建 STAGING / PROD 两个端点, 都在 version 1, 和前门 Gateway)
+(cd agent/evaldeck && agentcore deploy)
+
+# ③ 评估 (on-demand 需要会话结束 5 分钟后再评)
+$PYTHON evaluate/send_traffic.py --tag acc --endpoint STAGING
+$PYTHON evaluate/run_dataset.py --mode ondemand --segment acceptance --endpoint STAGING
+$PYTHON evaluate/simulate.py --endpoint STAGING
+$PYTHON evaluate/run_ondemand.py --sessions "$(ls -t out/sessions-acc-*.json | head -1)"
+$PYTHON evaluate/run_dataset.py --mode batch --evaluators Builtin.GoalSuccessRate Builtin.FailureAnalysis
+
+# ④ 发布: 先在 PROD (已发布版本) 上测基线并提交, 再部署候选、跑门禁、记录、发布
+$PYTHON evaluate/run_dataset.py --mode ondemand --segment acceptance --endpoint PROD
+$PYTHON evaluate/simulate.py --endpoint PROD
+$PYTHON release/gate.py --results "$(ls -t out/dataset-ondemand-*.results.json | head -1)" \
+    --results "$(ls -t out/simulate-*.results.json | head -1)" --write-baseline
+git add release/baseline.json && git commit -m "baseline on PROD"
+bash release/deploy_staging.sh                             # -> out/staging.json (gate_key)
+bash release/ci/gate_step.sh                               # PASS / BLOCKED, 与 CI 跑的是同一个脚本
+$PYTHON release/record.py                                  # SSM /evaldeck/gate/<gate_key>
+APPROVED_BY=<you@example.com> PIN_BUNDLE=0 bash release/release.sh   # 有 Config bundle 时设 GATEWAY_ID 并去掉 PIN_BUNDLE=0
+bash release/harden_default.sh                             # DEFAULT 端点拒绝直接调用
+DRY_RUN=1 bash release/protect_prod.sh                     # 先看 stack policy, 确认后去掉 DRY_RUN 执行一次
+
+# ⑤ 观测: PROD 上挂 Online 评估和告警
+SAMPLING_RATE=100 ENDPOINT=PROD bash observe/online_eval.sh     # 演示用 100 %, 生产按流量调低
+aws cloudformation deploy --stack-name evaldeck-alarms --template-file observe/alarms.yaml \
+    --parameter-overrides ServiceName=<runtime-name>.PROD OnlineEvalConfigId=<config-id> \
+    RuntimeArn=<runtime-arn> RuntimeMetricName=<runtime-name>::PROD
+$PYTHON evaluate/send_traffic.py --tag prod --endpoint PROD      # Online 结果约 15 分钟后到
+
+# ⑥ 回流: 低分 -> bad case 候选 -> 复核 -> 新数据集版本; 根因与提示词建议
+$PYTHON feedback/mine_badcases.py --results "$(ls -t out/simulate-*.results.json | head -1)"
+$PYTHON feedback/promote.py --reviewed feedback/reviewed/badcases-20261106-r1.jsonl   # 示例复核记录, 已在数据集里: 不发新版本
+ENDPOINT=STAGING SESSION_IDS="<sid> ..." bash feedback/failure_analysis.sh   # ENDPOINT = 这些会话所在的端点 (默认 PROD)
+HOURS=6 REWARD=evaldeck_ScopeJudge bash feedback/recommend.sh
+```
+
+要点:
+
+- `gate_key` 绑定 git commit, 所以 `registry.json` 和 `baseline.json` 要在 `deploy_staging.sh` 之前提交;
+  之后再提交会让 `release.sh` 的 `gate_key` 校验失败 (需要重跑 `deploy_staging.sh` + 门禁)。
+- 数据集发了新版本 (例如 `promote.py` 晋级了新的 bad case) 之后, 门禁会因为基线测在旧版本上而 BLOCKED,
+  按上面 ④ 的前三行在 PROD 上重测基线。
+- 可选部分没有在这次 clone 测试里重跑, 用法见下表和脚本头部注释: Config bundle A/B (`release/ab_test.sh`、`ab_ship.sh`)、
+  金丝雀 (`release/canary_rule.yaml`)、AgentCore Policy (`release/policy.sh`)、流水线 (`release/ci/pipeline.yaml`、
+  `github-actions.yml`, 两者都假定 kit 位于仓库根目录)。
 
 ## Step -> files -> what it does -> verified
 
