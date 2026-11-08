@@ -4,6 +4,12 @@ Each section: the most slide-worthy lines (copied verbatim from the file, line n
 removed) and one real output excerpt from the live validation on 2026-11-06 (account ids replaced by `<ACCOUNT_ID>`;
 demo agent and data = 演示数据). Full scripts: `<starter-kit-root-directory>/<path>`.
 
+2026-11-08 security fixes (AWS Continuum + Amazon Inspector findings, README "Security model") changed release/gate.py
+(evidence binding, coverage, fail-closed rules), release.sh (releases what the PASS record names), rollback_lambda.py
+(verified trigger), record.py, the CI files (staging environment, SHA-pinned actions, hash-pinned installs) and the
+OIDC roles; the excerpts below were refreshed for handler.py, main.py and gate_key.py. Where an excerpt and the
+script differ, the script is authoritative.
+
 ## ① define/requirements.yaml - the PRD as data
 
 `define/requirements.yaml` lines 26-41
@@ -189,21 +195,25 @@ Real output (redacted):
 
 ## ① define/evaluators/code_eval - CustomCode (Lambda) red line
 
-`define/evaluators/code_eval/handler.py` lines 101-113
+`define/evaluators/code_eval/handler.py` lines 159-175
 ```python
 def handler(event, context):
     spans = (event.get("evaluationInput") or {}).get("sessionSpans")
     if not isinstance(spans, list):
         return {"errorCode": "MissingSessionSpans", "errorMessage": "evaluationInput.sessionSpans is not a list"}
     try:
-        if not answers(spans):
-            return {"errorCode": "NoAgentAnswer", "errorMessage": f"no invoke_agent answer in {len(spans)} spans"}
-        found = check(spans)
+        n_answers, n_calls = len(answers(spans)), len(tool_calls(spans))
     except Exception as e:  # recorded as an evaluator error, never as a score for the agent
         return {"errorCode": "EvaluatorFailed", "errorMessage": f"{type(e).__name__}: {e}"[:500]}
-    if found:
-        return {"label": "VIOLATION", "value": 0.0, "explanation": "; ".join(found)[:900]}
+    if not n_answers and not n_calls:
+        return {"errorCode": "NoAgentAnswer", "errorMessage": f"no agent answer and no tool call in {len(spans)} spans"}
+    found, errors = check(spans)
+    if found:                      # a violation stands even if another rule could not run
+        return {"label": "VIOLATION", "value": 0.0, "explanation": "; ".join(found + errors)[:900]}
+    if errors:                     # could not measure: an evaluator error, not COMPLIANT
+        return {"errorCode": "EvaluatorFailed", "errorMessage": "; ".join(errors)[:500]}
     return {"label": "COMPLIANT", "value": 1.0,
+            "explanation": f"no red-line violation in {n_answers} answers / {n_calls} tool calls"}
 ```
 
 `define/evaluators/code_eval/deploy.sh` lines 42-45
@@ -282,13 +292,14 @@ def _system_prompt() -> tuple[str, tuple[tuple[str, str], ...]]:
                                       ("aws.agentcore.configbundle_arn", str(ref.bundle_arn) if ref else ""),
 ```
 
-`agent/evaldeck/app/ShopAgent/main.py` lines 46-50
+`agent/evaldeck/app/ShopAgent/main.py` lines 54-59
 ```python
-@lru_cache(maxsize=128)
+@lru_cache(maxsize=16)      # one microVM serves one runtime session; the cache only bounds repeated calls
 def _get_agent(session_id: str, system_prompt: str, source: tuple[tuple[str, str], ...]) -> Agent:
     # one Agent per session keeps multi-turn history in memory for the life of the runtime session
     return Agent(model=load_model(), system_prompt=system_prompt, tools=TOOLS,
-                 conversation_manager=NullConversationManager(), trace_attributes=dict(source))
+                 conversation_manager=SlidingWindowConversationManager(window_size=HISTORY_MESSAGES),
+                 trace_attributes=dict(source))
 ```
 
 
@@ -748,17 +759,21 @@ deployed project 'evaldeck' to target 'default'
 
 ## ④ release/gate_key.py - what was tested = what is released (v2)
 
-`release/gate_key.py` lines 48-56
+`release/gate_key.py` lines 62-74
 ```python
 def compute(commit: str, runtime_version: str, bundle_version: str | None, dataset_version: str,
-            gate_file: Path = KIT / "define/gate.yaml") -> str:
+            gate_file: Path = KIT / "define/gate.yaml", *, runtime_id: str = "", bundle_arn: str | None = None,
+            dataset_id: str = "") -> str:
     gate_sha = hashlib.sha256(gate_file.read_bytes()).hexdigest()
-    parts = [commit, str(runtime_version), bundle_version or "none", str(dataset_version), gate_sha]
+    parts = [commit, runtime_id, str(runtime_version), bundle_arn or "none", bundle_version or "none", dataset_id,
+             str(dataset_version), gate_sha, deciding_code_sha()]
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
 
 
 def from_staging(doc: dict) -> str:
-    return compute(doc["gitCommit"], doc["runtimeVersion"], doc.get("bundleVersion"), doc["datasetVersion"])
+    return compute(doc["gitCommit"], doc["runtimeVersion"], doc.get("bundleVersion"), doc["datasetVersion"],
+                   runtime_id=doc.get("runtimeId") or "", bundle_arn=doc.get("bundleArn"),
+                   dataset_id=doc.get("datasetId") or "")
 ```
 
 
