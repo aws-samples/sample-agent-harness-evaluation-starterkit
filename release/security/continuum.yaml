@@ -1,0 +1,103 @@
+# Step 4 Release - AWS Continuum code source in Amazon S3: the bucket the code zip and business context go into, and
+# the integration role AWS Continuum assumes to read them (role path /continuum/integrations/, external ID).
+# release/security/continuum_scan.sh deploys this stack, uploads the code, and creates the integration + environment.
+#   code/       one zip of the repository (git archive)               -> Source code base path
+#   context/    README, requirements.yaml, ... (business context)      -> Knowledge documents base path
+#   continuum-patches/   patches AWS Continuum writes back (PATCH artifacts of each issue)
+AWSTemplateFormatVersion: "2010-09-09"
+Description: evaldeck - S3 code source and integration role for AWS Continuum (code vulnerabilities)
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: evaldeck
+    AllowedPattern: "^[a-z][a-z0-9-]{1,20}$"
+  ExternalId:
+    Type: String
+    MinLength: 2
+    AllowedPattern: "^[\\w+=,.@:/-]+$"
+    Description: external ID the integration passes when it assumes the role (confused-deputy guard, not a secret)
+  CentralAccessLogBucket:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: existing central S3 access-log bucket; when set, the code bucket's access logs go there
+Conditions:
+  HasCentralAccessLog: !Not [!Equals [!Ref CentralAccessLogBucket, ""]]
+Resources:
+  CodeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LoggingConfiguration: !If
+        - HasCentralAccessLog
+        - DestinationBucketName: !Ref CentralAccessLogBucket
+          LogFilePrefix: !Sub "${NamePrefix}-continuum-code/"
+        - !Ref AWS::NoValue
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      VersioningConfiguration: {Status: Enabled}       # each upload is a new version; Continuum reads versions
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-versions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 30}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+  CodeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CodeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: [!GetAtt CodeBucket.Arn, !Sub "${CodeBucket.Arn}/*"]
+            Condition:
+              Bool: {"aws:SecureTransport": "false"}
+  IntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /continuum/integrations/                   # required by AWS Continuum
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ContinuumAccess
+            Effect: Allow
+            Principal: {Service: continuum.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: {"sts:ExternalId": !Ref ExternalId}
+      Tags: [{Key: project, Value: !Ref NamePrefix}]
+      Policies:
+        - PolicyName: continuum-s3-source
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListSourceBucket                  # unconditioned: Continuum validates access with it
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt CodeBucket.Arn
+              - Sid: ReadSourcePrefixes
+                Effect: Allow
+                Action: [s3:GetObject, s3:GetObjectVersion]
+                Resource: [!Sub "${CodeBucket.Arn}/code/*", !Sub "${CodeBucket.Arn}/context/*"]
+              - Sid: DeliverContinuumPatches
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:GetObjectVersion]
+                Resource: !Sub "${CodeBucket.Arn}/continuum-patches/*"
+Outputs:
+  CodeBucket:
+    Value: !Ref CodeBucket
+  IntegrationRoleArn:
+    Value: !GetAtt IntegrationRole.Arn
