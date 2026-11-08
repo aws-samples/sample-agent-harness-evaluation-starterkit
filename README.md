@@ -153,7 +153,8 @@ HOURS=1 bash release/policy.sh audit && bash release/policy.sh enforce
 
 # CodePipeline (S3 源): Source -> DeployStaging -> Gate -> 人工审批 -> Release
 aws cloudformation deploy --stack-name evaldeck-pipeline --template-file release/ci/pipeline.yaml \
-    --capabilities CAPABILITY_IAM --parameter-overrides AgentRuntimeArn=<runtime-arn> GatewayId=<gateway-id>
+    --capabilities CAPABILITY_IAM --parameter-overrides AgentRuntimeArn=<runtime-arn> GatewayId=<gateway-id> \
+    CentralAccessLogBucket=<existing org access-log bucket>    # 可选: 让模板自己的访问日志桶也记日志
 git archive -o /tmp/kit.zip HEAD && aws s3 cp /tmp/kit.zip s3://<SourceBucket>/evaldeck-kit.zip
 aws codepipeline start-pipeline-execution --name evaldeck-release     # 审批: 控制台或 put-approval-result
 
@@ -228,6 +229,9 @@ mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows
 
 ## Things the run taught (also in the script headers)
 
+- Security review (2026-11-08): checkov CKV_AWS_18 / 21 on the pipeline buckets. Artifact and source buckets log into a
+  dedicated access-log bucket and are versioned; that bucket cannot log into itself (AWS: endless loop), so it logs to an
+  optional `CentralAccessLogBucket` (an existing org log bucket) and has no access logging when the parameter is empty.
 - Clone run (CodeConnections, 2026-11-08): a single 0.5 flip of ScopeJudge on n = 7 BLOCKED as a regression: means are
   rounded to 4 decimals (0.9286 -> 0.8571 = 0.0715 > 0.5 / 7). `gate.py` now allows for the rounding (unit test added).
 - Clone run (2026-11-07): the sim segment BLOCKED in 3 of 3 runs (PR, CodePipeline, retry) on `evaldeck_ScopeJudge`

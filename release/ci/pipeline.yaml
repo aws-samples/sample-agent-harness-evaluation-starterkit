@@ -17,6 +17,7 @@
 #     BundleId=<bundle-id> BundleVersion=<version-id>          # SourceType=CodeConnections ConnectionArn=... FullRepositoryId=org/repo
 #   (S3 source) cd <starter-kit-root-directory> && git archive -o /tmp/kit.zip HEAD && \
 #     aws s3 cp /tmp/kit.zip s3://<SourceBucket output>/evaldeck-kit.zip
+#   optional: CentralAccessLogBucket=<existing org log bucket> so the access-log bucket is logged as well
 #   then: aws codepipeline start-pipeline-execution --name <prefix>-release   (the S3 source does not poll:
 #   PollForSourceChanges false and no EventBridge rule; the CodeConnections source triggers on push)
 #   BundleId / BundleVersion are optional: empty = the gate scores the code default prompt
@@ -63,8 +64,17 @@ Parameters:
     Default: "0"
     AllowedValues: ["0", "1"]
     Description: "1 = DeployStaging only re-points STAGING at the newest existing runtime version (no agentcore deploy)"
+  CentralAccessLogBucket:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: >-
+      Existing central S3 access-log bucket (for example the organization's logging account bucket). When set, the
+      template's own access-log bucket logs there too; when empty it has no access logging (a bucket must not log
+      into itself). The artifact and source buckets always log into the template's access-log bucket.
 Conditions:
   UseS3: !Equals [!Ref SourceType, S3]
+  HasCentralAccessLog: !Not [!Equals [!Ref CentralAccessLogBucket, ""]]
   UseConnection: !Equals [!Ref SourceType, CodeConnections]
 Resources:
   # ---------------------------------------------------------------- buckets: access logs, artifacts, source
@@ -72,12 +82,12 @@ Resources:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
-    Metadata:
-      checkov:
-        skip:
-          - id: CKV_AWS_18
-            comment: this is the access-log target bucket; logging it into itself would loop
     Properties:
+      LoggingConfiguration: !If                        # its own access logs go to the central bucket, if there is one
+        - HasCentralAccessLog
+        - DestinationBucketName: !Ref CentralAccessLogBucket
+          LogFilePrefix: !Sub "${NamePrefix}-pipeline-access-logs/"
+        - !Ref AWS::NoValue
       OwnershipControls:
         Rules: [{ObjectOwnership: BucketOwnerEnforced}]
       VersioningConfiguration: {Status: Enabled}
