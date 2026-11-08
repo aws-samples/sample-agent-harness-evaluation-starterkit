@@ -295,3 +295,12 @@ endpoint with `release/protect_prod.sh`; in production put STAGING and PROD in s
 | ⑤ online_eval.sh | own execution role (`--role-arn`): logs read on the runtime log group, logs write on `/aws/bedrock-agentcore/evaluations/*`, `bedrock:InvokeModel`, `lambda:InvokeFunction` + `GetFunction` on the code evaluator only |
 
 Slide-ready excerpts of every script: [`SNIPPETS.md`](SNIPPETS.md).
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
+
