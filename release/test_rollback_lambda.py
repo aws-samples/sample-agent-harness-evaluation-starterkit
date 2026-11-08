@@ -75,6 +75,7 @@ def env(monkeypatch):
     monkeypatch.setenv("EXPECTED_ACCOUNT", "123456789012")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.delenv("ALLOWED_ALARMS", raising=False)
+    monkeypatch.delenv("GATEWAY_ID", raising=False)       # CI projects set it
     monkeypatch.setenv("AGENT_RUNTIME_ID", "evaldeck_default_ShopAgent-abc")
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.delenv("AB_TEST_ID", raising=False)
