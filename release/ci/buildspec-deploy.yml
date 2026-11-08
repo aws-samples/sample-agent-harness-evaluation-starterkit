@@ -1,6 +1,8 @@
 # Step 4 Release - DeployStaging stage in AWS CodeBuild (release/ci/pipeline.yaml: Source -> DeployStaging -> Gate
 # -> Approval -> Release). Same step as the GitHub `deploy_staging` job: agentcore deploy, point STAGING at the new
 # runtime version, check that PROD did not move, write out/staging.json (runtime / bundle / dataset version, gate_key).
+# First the dependency scan (release/ci/security_scan.sh, Amazon Inspector): a finding at or above SECURITY_FAIL_ON
+# fails the build before anything is deployed.
 # Runs with DeployRole: CDK deploy + UpdateAgentRuntimeEndpoint on STAGING only; PROD and DEFAULT are denied.
 # Project env: AGENT_RUNTIME_ARN, BUNDLE_ID / BUNDLE_VERSION (optional), SKIP_DEPLOY.
 version: 0.2
@@ -19,8 +21,10 @@ phases:
   build:
     commands:
       - export GIT_COMMIT="${GIT_COMMIT:-$CODEBUILD_RESOLVED_SOURCE_VERSION}"
+      - bash release/ci/security_scan.sh               # Amazon Inspector SBOM scan; BLOCKED -> exit 1, nothing deployed
       - bash release/deploy_staging.sh
 artifacts:
   base-directory: out
   files:
     - staging.json
+    - security-report.json

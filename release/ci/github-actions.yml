@@ -1,7 +1,8 @@
 # Step 4 Release - GitHub Actions: PR gate on STAGING, release to PROD after human approval.
 # Copy to .github/workflows/agent-eval.yml (paths assume the kit is the repository root; if it lives in a
 # sub-directory, set `working-directory`, the `paths` filters and the out/ paths below to that directory).
-#   pr       every PR + every push to main: deploy the candidate to STAGING with the deploy role, then switch to the
+#   pr       every PR + every push to main: dependency scan (Amazon Inspector), deploy the candidate to STAGING with
+#            the deploy role, then switch to the
 #            gate role (no deploy, no endpoint changes) and run the gate (acceptance + sim segments, bundle version
 #            as baggage), record the decision in SSM, upload the report
 #   release  push to main only, after `pr` passed: `environment: production` (Settings -> Environments ->
@@ -61,6 +62,8 @@ jobs:
           pip install -r requirements.txt uv     # uv: agentcore packages the CodeZip runtime with it
           npm i -g @aws/agentcore@1.0.1
           (cd agent/evaldeck/agentcore/cdk && npm ci)
+      - name: Dependency scan (Amazon Inspector SBOM; blocks before anything is deployed)
+        run: bash release/ci/security_scan.sh
       - name: Deploy candidate to STAGING
         run: bash release/deploy_staging.sh
       - name: Gate role (no deploy, no endpoint changes)
@@ -85,6 +88,7 @@ jobs:
         with:
           name: gate-report
           path: |
+            out/security-report.json
             out/staging.json
             out/gate-report.json
             out/*.results.json

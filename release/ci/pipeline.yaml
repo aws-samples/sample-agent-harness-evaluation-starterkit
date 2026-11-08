@@ -230,6 +230,10 @@ Resources:
               - Effect: Allow
                 Action: [s3:GetObject, s3:GetObjectVersion, s3:PutObject]
                 Resource: !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: DependencyScan                     # release/ci/security_scan.sh (Amazon Inspector Scan API)
+                Effect: Allow
+                Action: inspector-scan:ScanSbom
+                Resource: "*"
               - Sid: CdkDeployViaBootstrapRoles          # agentcore deploy = CDK: deploy / publish / lookup roles
                 Effect: Allow
                 Action: sts:AssumeRole

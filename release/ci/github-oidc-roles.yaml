@@ -70,6 +70,10 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              - Sid: DependencyScan                     # release/ci/security_scan.sh (Amazon Inspector Scan API)
+                Effect: Allow
+                Action: inspector-scan:ScanSbom
+                Resource: "*"
               - Sid: CdkDeployViaBootstrapRoles
                 Effect: Allow
                 Action: sts:AssumeRole
