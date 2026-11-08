@@ -9,6 +9,8 @@ import rollback_lambda as rb
 
 def alarm_event(name, state="ALARM"):
     return {"version": "0", "source": "aws.cloudwatch", "detail-type": "CloudWatch Alarm State Change",
+            "account": "123456789012", "region": "us-east-1",
+            "resources": [f"arn:aws:cloudwatch:us-east-1:123456789012:alarm:{name}"],
             "detail": {"alarmName": name, "state": {"value": state, "reason": "Threshold Crossed"},
                        "previousState": {"value": "OK"}}}
 
@@ -60,8 +62,19 @@ class FakeData:
         self.updates.append(kw)
 
 
+class FakeCW:
+    def __init__(self, state="ALARM"):
+        self.state = state
+
+    def describe_alarms(self, AlarmNames):
+        return {"MetricAlarms": [{"AlarmName": AlarmNames[0], "StateValue": self.state}] if self.state else []}
+
+
 @pytest.fixture(autouse=True)
 def env(monkeypatch):
+    monkeypatch.setenv("EXPECTED_ACCOUNT", "123456789012")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("ALLOWED_ALARMS", raising=False)
     monkeypatch.setenv("AGENT_RUNTIME_ID", "evaldeck_default_ShopAgent-abc")
     monkeypatch.setenv("DRY_RUN", "false")
     monkeypatch.delenv("AB_TEST_ID", raising=False)
@@ -133,3 +146,34 @@ def test_rollback_also_moves_the_bundle_rule(monkeypatch):
     assert d["bundle"] == {"from": "v-new", "to": "v-old"}
     assert ctl.rule_updates[0]["actions"][0]["configurationBundle"]["staticOverride"]["bundleVersion"] == "v-old"
     assert ssm.store["/evaldeck/release/current"]["bundleVersion"] == "v-old"
+
+
+def test_forged_or_stale_triggers_are_ignored(monkeypatch):
+    ssm = lambda: FakeSSM({"current": "7", "previous": "5"})  # noqa: E731
+    cases = [
+        ({**alarm_event("evaldeck-shopagent-redline"), "source": "my.app"}, FakeCW(), "not a CloudWatch"),
+        ({**alarm_event("evaldeck-shopagent-redline"), "account": "999999999999"}, FakeCW(), "account"),
+        ({**alarm_event("evaldeck-shopagent-redline"),
+          "resources": ["arn:aws:cloudwatch:us-east-1:123456789012:alarm:other"]}, FakeCW(), "alarm ARN"),
+        (alarm_event("evaldeck-shopagent-redline"), FakeCW("OK"), "DescribeAlarms"),     # direct invoke, alarm is OK
+        (alarm_event("evaldeck-shopagent-redline"), FakeCW(None), "missing"),
+    ]
+    for ev, cw, why in cases:
+        ctl = FakeControl()
+        d = rb.handler(ev, None, (ctl, FakeData(), ssm(), cw))
+        assert d["decision"] == "ignored" and why in d["why"] and ctl.calls == [], (why, d)
+    monkeypatch.setenv("ALLOWED_ALARMS", "evaldeck-shopagent-goal-score")
+    d = rb.handler(alarm_event("evaldeck-shopagent-redline"), None, (FakeControl(), FakeData(), ssm(), FakeCW()))
+    assert d["decision"] == "ignored" and "ALLOWED_ALARMS" in d["why"]
+
+
+def test_record_keeps_the_served_bundle_when_the_ship_rule_was_not_moved():
+    ctl, ssm = FakeControl(), FakeSSM()                     # GATEWAY_ID not set
+    ssm.store = {"/evaldeck/release/current": {"runtimeVersion": "7", "bundleArn": "arn:b", "bundleVersion": "v-new",
+                                               "gate_key": "k7", "rollbacks": []},
+                 "/evaldeck/release/previous": {"runtimeVersion": "5", "bundleArn": "arn:b", "bundleVersion": "v-old",
+                                                "gate_key": "k5"}}
+    d = rb.handler(alarm_event("evaldeck-shopagent-redline"), None, (ctl, FakeData(), ssm, FakeCW()))
+    rec = ssm.store["/evaldeck/release/current"]
+    assert rec["runtimeVersion"] == "5" and rec["bundleVersion"] == "v-new" and rec["bundleNotRolledBack"]
+    assert d["bundle_warning"]

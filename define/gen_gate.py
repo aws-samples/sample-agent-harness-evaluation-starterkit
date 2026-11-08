@@ -50,6 +50,8 @@ def build(req: dict) -> tuple[dict, list[str]]:
             errs.append(f"{ev}: rule {rule!r} not in {sorted(RULES)}")
         if tier == "redline" and rule != "violations_eq0":
             errs.append(f"{ev}: a redline must use rule violations_eq0")
+        if tier != "redline" and rule == "violations_eq0":
+            errs.append(f"{ev}: violations_eq0 is a red-line rule: use tier redline")
         if rule == "mean_gte" and not isinstance(c.get("threshold"), (int, float)):
             errs.append(f"{ev}: mean_gte needs a numeric threshold")
         unknown = set(c.get("req", [])) - req_ids

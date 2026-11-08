@@ -74,6 +74,7 @@ Parameters:
       into itself). The artifact and source buckets always log into the template's access-log bucket.
 Conditions:
   UseS3: !Equals [!Ref SourceType, S3]
+  HasGateway: !Not [!Equals [!Ref GatewayId, ""]]
   HasCentralAccessLog: !Not [!Equals [!Ref CentralAccessLogBucket, ""]]
   UseConnection: !Equals [!Ref SourceType, CodeConnections]
 Resources:
@@ -423,7 +424,9 @@ Resources:
               - Sid: ReadGateRecordWriteReleaseRecord
                 Effect: Allow
                 Action: ssm:GetParameter
-                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/gate/*"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
               - Effect: Allow
                 Action: [ssm:PutParameter, ssm:AddTagsToResource]
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
@@ -431,10 +434,19 @@ Resources:
                 Effect: Allow
                 Action: [bedrock-agentcore:GetAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint]
                 Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/PROD"]
-              - Sid: PinBundleOnGateway
-                Effect: Allow
-                Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:CreateGatewayRule, bedrock-agentcore:UpdateGatewayRule]
-                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+              - !If
+                - HasGateway
+                - Sid: PinBundleOnGateway              # only the front door this pipeline releases through
+                  Effect: Allow
+                  Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:CreateGatewayRule, bedrock-agentcore:UpdateGatewayRule]
+                  Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${GatewayId}"
+                - !Ref AWS::NoValue
+              - Sid: NeverTouchStagingOrDefault          # the runtime ARN above is required for the call, so deny the rest
+                Effect: Deny
+                Action: [bedrock-agentcore:UpdateAgentRuntimeEndpoint, bedrock-agentcore:DeleteAgentRuntimeEndpoint]
+                Resource:
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/STAGING"
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/DEFAULT"
               - Sid: WhoApproved
                 Effect: Allow
                 Action: codepipeline:ListActionExecutions

@@ -27,8 +27,8 @@ MAX = 4096   # SSM Standard tier
 
 def build(report: dict, staging: dict, report_bytes: bytes) -> dict:
     rec = {"gate_key": report["gate_key"], "verdict": report["decision"], "at": report["at"],
-           "staging": {k: staging.get(k) for k in ("runtimeVersion", "bundleArn", "bundleVersion", "datasetVersion",
-                                                   "gitCommit")},
+           "staging": {k: staging.get(k) for k in ("runtimeId", "runtimeVersion", "bundleArn", "bundleVersion",
+                                                   "datasetId", "datasetVersion", "gitCommit")},
            "segments": {s: v["decision"] for s, v in (report.get("segments") or {}).items()},
            "waived": report.get("waived", []), "reasons": [r[:160] for r in report.get("reasons", [])][:5],
            "metrics": [[m["segment"], m["metric"], m["status"], m["mean"], m["n"]] for m in report["metrics"]],

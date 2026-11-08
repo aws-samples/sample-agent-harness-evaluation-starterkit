@@ -19,11 +19,16 @@ Action: UpdateAgentRuntimeEndpoint(PROD -> previous.runtimeVersion); if the prev
 and GATEWAY_ID is set, the front-door ship rule (release/ab_ship.sh) goes back to that bundle version too
 (UpdateGatewayRule). Then current := previous (+ the rollback entry), previous := null.
 DRY_RUN=true (default) logs the decision without changing anything.
+The trigger is verified, not trusted: the event must be a CloudWatch alarm state change from this account and Region
+(EventBridge sets `source`, `account`, `resources`), the alarm must be in ALLOWED_ALARMS when that is set, and the
+alarm's current state is re-read with DescribeAlarms - a forged event or a direct invoke for an alarm that is not
+actually in ALARM changes nothing. The release record only claims a bundle rollback when the ship rule was moved.
 
-Env: NAME_PREFIX, AGENT_RUNTIME_ID, ENDPOINT_NAME (PROD), GATEWAY_ID (optional), AB_TEST_ID (optional), DRY_RUN.
+Env: NAME_PREFIX, AGENT_RUNTIME_ID, ENDPOINT_NAME (PROD), GATEWAY_ID (optional), AB_TEST_ID (optional), DRY_RUN,
+     EXPECTED_ACCOUNT (the function's account), ALLOWED_ALARMS (comma-separated alarm names; empty = any <prefix>- alarm).
 IAM: bedrock-agentcore:UpdateAgentRuntimeEndpoint on the runtime (+ its runtime-endpoint/*),
 bedrock-agentcore:ListGatewayRules/UpdateGatewayRule (if GATEWAY_ID), GetABTest/UpdateABTest (if AB_TEST_ID),
-ssm:GetParameter/PutParameter on parameter/<prefix>/release/*.
+ssm:GetParameter/PutParameter on parameter/<prefix>/release/*, cloudwatch:DescribeAlarms.
 """
 
 from __future__ import annotations
@@ -57,7 +62,30 @@ def decide(alarm_name: str, release: dict | None, ab_running: bool = False) -> d
 
 def _clients():
     import boto3
-    return boto3.client("bedrock-agentcore-control"), boto3.client("bedrock-agentcore"), boto3.client("ssm")
+    return (boto3.client("bedrock-agentcore-control"), boto3.client("bedrock-agentcore"), boto3.client("ssm"),
+            boto3.client("cloudwatch"))
+
+
+def verify_trigger(event: dict, cw) -> str | None:
+    """-> None when the event is a genuine ALARM transition of an allowed alarm, else the reason to ignore it."""
+    detail = event.get("detail") or {}
+    alarm = detail.get("alarmName", "")
+    if event.get("source") != "aws.cloudwatch" or event.get("detail-type") != "CloudWatch Alarm State Change":
+        return "not a CloudWatch alarm state change event"
+    acct, region = os.getenv("EXPECTED_ACCOUNT"), os.getenv("AWS_REGION")
+    if acct and event.get("account") != acct:
+        return f"event from account {event.get('account')}, expected {acct}"
+    arn = (event.get("resources") or [""])[0]
+    if acct and region and arn != f"arn:aws:cloudwatch:{region}:{acct}:alarm:{alarm}" and \
+            not arn.endswith(f":{region}:{acct}:alarm:{alarm}"):
+        return f"alarm ARN {arn} is not {alarm} in {region} / {acct}"
+    allowed = {a.strip() for a in os.getenv("ALLOWED_ALARMS", "").split(",") if a.strip()}
+    if allowed and alarm not in allowed:
+        return f"alarm {alarm} is not in ALLOWED_ALARMS"
+    live = (cw.describe_alarms(AlarmNames=[alarm]).get("MetricAlarms") or [{}])[0].get("StateValue") if cw else None
+    if cw and live != "ALARM":
+        return f"alarm {alarm} is {live or 'missing'} now (DescribeAlarms), not ALARM"
+    return None
 
 
 def _get(ssm, name):
@@ -72,7 +100,12 @@ def handler(event, context, clients=None):
     alarm = detail.get("alarmName", "")
     if (detail.get("state") or {}).get("value") != "ALARM":
         return {"alarm": alarm, "decision": "ignored", "why": "state is not ALARM"}
-    ctl, dp, ssm = clients or _clients()
+    ctl, dp, ssm, cw = (tuple(clients) + (None,))[:4] if clients else _clients()
+    if ALARM.match(alarm):
+        why = verify_trigger(event, cw)
+        if why:
+            print(json.dumps({"event": "rollback-decision", "alarm": alarm, "decision": "ignored", "why": why}))
+            return {"alarm": alarm, "decision": "ignored", "why": why}
     base = f"/{PREFIX}/release"
     cur, prev = (_get(ssm, f"{base}/current"), _get(ssm, f"{base}/previous")) if ALARM.match(alarm) else (None, None)
     release = cur and {"current": cur.get("runtimeVersion"), "previous": (prev or {}).get("runtimeVersion"),
@@ -93,7 +126,7 @@ def handler(event, context, clients=None):
                                           endpointName=os.getenv("ENDPOINT_NAME", "PROD"),
                                           agentRuntimeVersion=str(d["to"]))
     d["endpoint"] = {"liveVersion": r.get("liveVersion"), "targetVersion": r.get("targetVersion")}
-    gw = os.getenv("GATEWAY_ID")
+    gw, bundle_moved = os.getenv("GATEWAY_ID"), False
     if gw and prev.get("bundleVersion") and prev.get("bundleVersion") != cur.get("bundleVersion"):
         rule = next((x for x in ctl.list_gateway_rules(gatewayIdentifier=gw).get("gatewayRules", [])
                      if (x.get("description") or "").startswith(f"{PREFIX}-ship")), None)
@@ -103,8 +136,14 @@ def handler(event, context, clients=None):
                                     actions=[{"configurationBundle": {"staticOverride": {
                                         "bundleArn": prev["bundleArn"], "bundleVersion": prev["bundleVersion"]}}}])
             d["bundle"] = {"from": cur.get("bundleVersion"), "to": prev["bundleVersion"]}
+            bundle_moved = True
     entry = {"from": d["from"], "to": d["to"], "alarm": alarm, "at": d["at"]}
-    ssm.put_parameter(Name=f"{base}/current", Type="String", Overwrite=True, Value=json.dumps(
-        {**prev, "rollbacks": [*cur.get("rollbacks", []), entry], "rolledBackFrom": cur.get("gate_key")}))
+    new = {**prev, "rollbacks": [*cur.get("rollbacks", []), entry], "rolledBackFrom": cur.get("gate_key")}
+    if not bundle_moved and prev.get("bundleVersion") != cur.get("bundleVersion"):
+        # the endpoint moved but the ship rule did not: the record must say which bundle PROD still serves
+        new.update(bundleArn=cur.get("bundleArn"), bundleVersion=cur.get("bundleVersion"),
+                   bundleNotRolledBack="GATEWAY_ID not set or ship rule not found")
+        d["bundle_warning"] = new["bundleNotRolledBack"]
+    ssm.put_parameter(Name=f"{base}/current", Type="String", Overwrite=True, Value=json.dumps(new))
     ssm.put_parameter(Name=f"{base}/previous", Type="String", Overwrite=True, Value=json.dumps(None))
     return d

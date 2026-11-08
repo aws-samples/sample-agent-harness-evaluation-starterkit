@@ -10,7 +10,7 @@
 #   aws logs tail /aws/lambda/<prefix>-rollback --since 10m        # {"event": "rollback-decision", ...}
 # and DRY_RUN=false bash release/deploy_rollback.sh to arm it. One automatic rollback per release; re-release with
 # release/release.sh (or the pipeline) afterwards.
-# Env: AWS_REGION, NAME_PREFIX, DRY_RUN (true), GATEWAY_ID, AB_TEST_ID (optional), CODE_BUCKET.
+# Env: AWS_REGION, NAME_PREFIX, DRY_RUN (true), GATEWAY_ID, AB_TEST_ID, ALLOWED_ALARMS (optional), CODE_BUCKET.
 # IAM: s3:PutObject on the code bucket, cloudformation deploy + iam:CreateRole/PutRolePolicy/PassRole for the stack.
 # Usage: bash release/deploy_rollback.sh
 set -euo pipefail
@@ -30,7 +30,7 @@ aws s3 cp out/rollback-lambda.zip "s3://${BUCKET}/${KEY}" --region "$REGION" --o
 aws cloudformation deploy --stack-name "${PREFIX}-rollback" --template-file release/rollback.yaml --region "$REGION" \
   --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset --tags project="$PREFIX" \
   --parameter-overrides NamePrefix="$PREFIX" AgentRuntimeArn="$ARN" DryRun="${DRY_RUN:-true}" \
-    GatewayId="${GATEWAY_ID:-}" AbTestId="${AB_TEST_ID:-}" CodeS3Bucket="$BUCKET" CodeS3Key="$KEY"
+    GatewayId="${GATEWAY_ID:-}" AbTestId="${AB_TEST_ID:-}" AllowedAlarms="${ALLOWED_ALARMS:-}" CodeS3Bucket="$BUCKET" CodeS3Key="$KEY"
 aws lambda get-function-configuration --function-name "${PREFIX}-rollback" --region "$REGION" \
   --query '{function:FunctionName,state:State,dryRun:Environment.Variables.DRY_RUN,runtime:Environment.Variables.AGENT_RUNTIME_ID}' \
   --output json

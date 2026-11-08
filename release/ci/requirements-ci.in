@@ -1,0 +1,4 @@
+# CI install set: the kit requirements + uv (agentcore packages the CodeZip runtime with it).
+# Lock: uv pip compile release/ci/requirements-ci.in --universal --python-version 3.12 --generate-hashes -o release/ci/requirements.lock
+-r ../../requirements.txt
+uv

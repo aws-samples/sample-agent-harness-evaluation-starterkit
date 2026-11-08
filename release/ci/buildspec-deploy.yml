@@ -15,7 +15,7 @@ phases:
       python: 3.12
       nodejs: 22
     commands:
-      - pip install -q -r requirements.txt uv            # uv: agentcore packages the CodeZip runtime with it
+      - pip install -q --require-hashes -r release/ci/requirements.lock   # kit requirements + uv, hash-pinned
       - npm i -g @aws/agentcore@1.0.1 >/dev/null
       - (cd agent/evaldeck/agentcore/cdk && npm ci --no-audit --no-fund >/dev/null)
   build:

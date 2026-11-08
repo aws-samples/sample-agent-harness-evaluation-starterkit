@@ -1,0 +1,9 @@
+# Copy to .github/CODEOWNERS and turn on "Require review from Code Owners" in the branch protection of main.
+# The release gate's code ships in the commit it judges: whoever can merge changes to these paths can change what
+# PASS means. Keep them owned by the team that owns release quality (replace the placeholder team).
+/release/            @your-org/release-owners
+/define/             @your-org/release-owners
+/evaluate/           @your-org/release-owners
+/common/             @your-org/release-owners
+/observe/            @your-org/release-owners
+/.github/workflows/  @your-org/release-owners

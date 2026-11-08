@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Step 4 Release - gate_key: the fingerprint that ties a gate decision to exactly what gets released.
 
-gate_key = sha256(git commit, runtimeVersion, bundleVersion, datasetVersion, sha256(define/gate.yaml))[:16]
+gate_key = sha256(git commit, runtimeId, runtimeVersion, bundleArn, bundleVersion, datasetId, datasetVersion,
+                  sha256(define/gate.yaml), sha256(deciding code: gate.py, gate_step.sh, record.py, evaluate/, kit.py))[:16]
   - git commit      GIT_COMMIT / GITHUB_SHA / CODEBUILD_RESOLVED_SOURCE_VERSION / `git rev-parse HEAD`
                     (+ "+dirty:<content hash>" when starter-kit/ has uncommitted changes; "nogit:<content hash>"
                     without git, e.g. an S3 source zip)
@@ -45,15 +46,32 @@ def git_commit() -> str:
         return f"nogit:{content_key()}"
 
 
+# the code that decides PASS / BLOCKED is part of the key as well (with an S3 source there is no git commit)
+DECIDING_CODE = ["release/gate.py", "release/ci/gate_step.sh", "release/record.py", "evaluate", "common/kit.py"]
+
+
+def deciding_code_sha(root: Path = KIT) -> str:
+    h = hashlib.sha256()
+    for rel in DECIDING_CODE:
+        p = root / rel
+        for f in [p] if p.is_file() else sorted(x for x in p.rglob("*.py") if "__pycache__" not in x.parts):
+            h.update(str(f.relative_to(root)).encode() + b"\0" + f.read_bytes() + b"\0")
+    return h.hexdigest()
+
+
 def compute(commit: str, runtime_version: str, bundle_version: str | None, dataset_version: str,
-            gate_file: Path = KIT / "define/gate.yaml") -> str:
+            gate_file: Path = KIT / "define/gate.yaml", *, runtime_id: str = "", bundle_arn: str | None = None,
+            dataset_id: str = "") -> str:
     gate_sha = hashlib.sha256(gate_file.read_bytes()).hexdigest()
-    parts = [commit, str(runtime_version), bundle_version or "none", str(dataset_version), gate_sha]
+    parts = [commit, runtime_id, str(runtime_version), bundle_arn or "none", bundle_version or "none", dataset_id,
+             str(dataset_version), gate_sha, deciding_code_sha()]
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:16]
 
 
 def from_staging(doc: dict) -> str:
-    return compute(doc["gitCommit"], doc["runtimeVersion"], doc.get("bundleVersion"), doc["datasetVersion"])
+    return compute(doc["gitCommit"], doc["runtimeVersion"], doc.get("bundleVersion"), doc["datasetVersion"],
+                   runtime_id=doc.get("runtimeId") or "", bundle_arn=doc.get("bundleArn"),
+                   dataset_id=doc.get("datasetId") or "")
 
 
 def main() -> int:

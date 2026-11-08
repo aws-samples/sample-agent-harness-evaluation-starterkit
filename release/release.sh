@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Step 4 Release - move PROD to exactly what the gate passed, and keep the release record for rollback.
 #
-#   1. recompute gate_key from out/staging.json (release/gate_key.py --check): content, runtime version, bundle
+#   1. recompute gate_key from out/staging.json (release/gate_key.py --check): content, runtime id + version, bundle
 #      version, dataset version and gate.yaml must be the ones the gate decided on
 #   2. require a PASS record /<prefix>/gate/<gate_key> (release/record.py) and an approver (APPROVED_BY; in CI the
 #      approval is the GitHub environment reviewer / the CodePipeline Manual approval)
@@ -28,13 +28,22 @@ read -r RUNTIME_ID VERSION ST_BUNDLE_ARN ST_BUNDLE_VERSION < <("$PY" -c "
 import json; d = json.load(open('$STAGING_FILE'))
 print(d['runtimeId'], d['runtimeVersion'], d.get('bundleArn') or '-', d.get('bundleVersion') or '-')")
 
-# 2. PASS record
-VERDICT=$(aws ssm get-parameter --name "/${PREFIX}/gate/${KEY}" --region "$REGION" --query Parameter.Value \
-  --output text 2>/dev/null | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["verdict"])' || echo MISSING)
+# 2. PASS record, and it must name exactly what staging.json asks to release (the record is written by the gate
+#    role; the release stage only reads it)
+RECORD=$(aws ssm get-parameter --name "/${PREFIX}/gate/${KEY}" --region "$REGION" --query Parameter.Value \
+  --output text 2>/dev/null || echo '{"verdict": "MISSING"}')
+VERDICT=$(printf '%s' "$RECORD" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["verdict"])')
 if [ "$VERDICT" != PASS ]; then
   echo "refusing to release: gate record /${PREFIX}/gate/${KEY} is ${VERDICT}" >&2
   exit 1
 fi
+printf '%s' "$RECORD" | "$PY" -c "
+import json, sys
+rec, st = json.load(sys.stdin)['staging'], json.load(open('$STAGING_FILE'))
+diff = {k: (rec.get(k), st.get(k)) for k in rec if str(rec.get(k)) != str(st.get(k))}
+if diff:
+    sys.exit(f'refusing to release: staging.json differs from the gate record: {diff}')
+" || exit 1
 OLD=$(aws bedrock-agentcore-control get-agent-runtime-endpoint --agent-runtime-id "$RUNTIME_ID" --endpoint-name PROD \
   --region "$REGION" --query liveVersion --output text)
 echo "{\"gate_key\": \"$KEY\", \"verdict\": \"$VERDICT\", \"prod\": \"$OLD -> $VERSION\", \"bundle\": \"$ST_BUNDLE_VERSION\", \"approved_by\": \"$APPROVED_BY\"}"

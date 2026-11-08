@@ -16,7 +16,10 @@ decision lives here. Rules, from define/gate.yaml (generated from requirements.y
 Segments: every results file belongs to one segment (doc["segment"], or `--results sim=out/simulate-x.json`).
 `acceptance` (run_dataset.py on the pinned Dataset version) is judged on every metric in gate.yaml; other
 segments (`sim` = simulate.py, a `redteam` set if you add one) on the metrics their run requested, plus every
-red line. Each segment has its own baseline (baseline.json "segments"); all segments must PASS. A metric's
+red line. Each segment has its own baseline (baseline.json "segments"); all segments must PASS.
+Fail closed: a rule the gate does not implement BLOCKS; every scenario of the pinned dataset (and every persona) must
+have been scored; with out/staging.json every results file must come from that staging run (endpoint, runtime ARN,
+dataset id + version, Config bundle version, created after the deployment), else BLOCKED. A metric's
 `segment_tiers` (gate.yaml, from requirements.yaml) can make it observe-only in one segment; red lines never.
 
 Waivers (release/waivers.yaml): a named approver may lower the threshold of one `gate` metric to a floor until
@@ -98,6 +101,9 @@ def merge_segments(paths: list[Path]) -> dict[str, dict]:
             continue
         s = segs.setdefault(seg or doc.get("segment") or PRIMARY, _empty())
         s["dataset"] = s["dataset"] or doc.get("dataset")
+        s["docs"].append((p, doc))
+        s["scenarios"] |= {i.get("scenario_id") for i in doc.get("items", [])
+                           if i.get("scenario_id") and i.get("evaluator") != "_invocation" and i.get("value") is not None}
         s["requested"] |= {_canon(k) for k in (doc.get("evaluators") or {})}
         for name, m in doc.get("metrics", {}).items():
             cur = s["metrics"].setdefault(name, {"values": [], "errors": 0})
@@ -118,7 +124,8 @@ def merge_segments(paths: list[Path]) -> dict[str, dict]:
 
 
 def _empty() -> dict:
-    return {"metrics": {}, "dataset": None, "problems": [], "requested": set(), "bundle": None}
+    return {"metrics": {}, "dataset": None, "problems": [], "requested": set(), "bundle": None, "docs": [],
+            "scenarios": set()}
 
 
 def _canon(name: str) -> str:
@@ -193,11 +200,14 @@ def decide(gate: dict, metrics: dict, dataset: dict | None, baseline: dict | Non
             row["why"].append(f"not measured ({n} scored results < {min_n})")
         if err_rate > max_err:
             row["why"].append(f"evaluator error rate {err_rate:.0%} > {max_err:.0%}")
-        if tier == "redline":
+        rule = spec.get("rule")
+        if rule not in ("mean_gte", "violations_eq0"):
+            row["why"].append(f"unknown rule {rule!r}: the gate cannot evaluate it")
+        if rule == "violations_eq0" or tier == "redline":
             bad = sum(1 for v in vals if v < 1.0)
             row["violations"] = bad
             if bad:
-                row["why"].append(f"{bad} red-line violation(s)")
+                row["why"].append(f"{bad} red-line violation(s)" if tier == "redline" else f"{bad} violation(s)")
         if spec.get("rule") == "mean_gte" and mean is not None and mean < spec["threshold"] - 1e-9:
             if w and tier == "gate" and mean >= float(w["floor"]) - 1e-9:
                 w.update(status="applied", why=f"{segment}: mean {mean} < threshold {spec['threshold']}, >= floor {w['floor']}")
@@ -234,6 +244,45 @@ def _segment_baseline(baseline: dict | None, seg: str) -> dict | None:
     return baseline if seg == PRIMARY else None       # v1 baseline.json = acceptance only
 
 
+def expected_scenarios(seg: str, dataset: dict | None) -> int | None:
+    """Scenario count the segment must cover: the pinned dataset version's rows (registry.json) for the primary
+    segment, the persona file for `sim`. None = unknown (no coverage check)."""
+    if seg == PRIMARY and dataset:
+        reg = KIT / "define/datasets/registry.json"
+        entry = (json.loads(reg.read_text()) if reg.exists() else {}).get(dataset.get("name") or "", {})
+        if entry.get("id") == dataset.get("id"):
+            v = next((x for x in entry.get("versions", []) if str(x["version"]) == str(dataset.get("version"))), None)
+            return v and v.get("rows")
+    if seg == "sim":
+        f = KIT / "define/datasets/personas.jsonl"
+        return sum(1 for line in f.read_text().splitlines() if line.strip()) if f.exists() else None
+    return None
+
+
+def binding_problems(staging: dict, segs: dict) -> list[str]:
+    """Every results file must be evidence about the candidate staging.json names."""
+    out = []
+    want_bundle = staging.get("bundleVersion")
+    for seg, s in segs.items():
+        for p, doc in s["docs"]:
+            agent = doc.get("agent") or {}
+            if agent.get("endpoint") and agent["endpoint"] != staging.get("endpoint"):
+                out.append(f"{p.name}: ran on {agent['endpoint']}, staging is {staging.get('endpoint')}")
+            if agent.get("runtime_arn") and staging.get("runtimeArn") and agent["runtime_arn"] != staging["runtimeArn"]:
+                out.append(f"{p.name}: runtime {agent['runtime_arn'].rsplit('/', 1)[-1]} is not {staging.get('runtimeId')}")
+            got_bundle = (agent.get("bundle") or {}).get("version")
+            if str(got_bundle or "") != str(want_bundle or ""):
+                out.append(f"{p.name}: Config bundle {got_bundle} but staging pins {want_bundle}")
+            if doc.get("created_at") and staging.get("at") and str(doc["created_at"]) < str(staging["at"]):
+                out.append(f"{p.name}: created {doc['created_at']} before the staging deployment {staging['at']}")
+            ds = doc.get("dataset") or {}
+            if seg == PRIMARY and (str(ds.get("version")) != str(staging.get("datasetVersion"))
+                                   or (staging.get("datasetId") and ds.get("id") != staging["datasetId"])):
+                out.append(f"{p.name}: dataset {ds.get('id')} v{ds.get('version')} is not the pinned "
+                           f"{staging.get('datasetId')} v{staging.get('datasetVersion')}")
+    return out
+
+
 def resolve_gate_key(arg: str | None, staging: Path) -> str | None:
     if arg or os.getenv("GATE_KEY"):
         return arg or os.getenv("GATE_KEY")
@@ -264,6 +313,13 @@ def main() -> int:
     waivers, waiver_report = load_waivers(a.waivers)
     if a.write_baseline:
         gate = {**gate, "policy": {**gate.get("policy", {}), "require_baseline": False}}
+    staging_doc = json.loads(a.staging.read_text()) if a.staging.exists() and not a.write_baseline else None
+    if staging_doc:                        # baselines are measured on PROD, so no staging binding for them
+        segs[PRIMARY]["problems"] += binding_problems(staging_doc, segs)
+    for seg, s in segs.items():
+        want = expected_scenarios(seg, s["dataset"])
+        if want and s["docs"] and len(s["scenarios"]) < want:
+            s["problems"].append(f"{seg}: {len(s['scenarios'])} of {want} scenarios scored (coverage)")
     results, reasons, rows = {}, [], []
     for seg, s in segs.items():
         only = None if seg == PRIMARY else s["requested"]

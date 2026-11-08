@@ -160,13 +160,31 @@ aws codepipeline start-pipeline-execution --name evaldeck-release     # 审批: 
 
 # GitHub Actions: 三个 OIDC 角色, 仓库 secrets / vars, production environment (required reviewers)
 aws cloudformation deploy --stack-name evaldeck-github-oidc --template-file release/ci/github-oidc-roles.yaml \
-    --capabilities CAPABILITY_IAM --parameter-overrides GitHubRepository=<owner>/<repo> AgentRuntimeArn=<runtime-arn>
+    --capabilities CAPABILITY_IAM --parameter-overrides GitHubRepository=<owner>/<repo> AgentRuntimeArn=<runtime-arn> \
+    GitHubOwnerId=<id> GitHubRepositoryId=<id>    # ids: gh api repos/<owner>/<repo>/actions/oidc/customization/sub
+# GitHub environments: staging (pr job; required reviewers recommended) and production (release job)
 gh secret set AWS_DEPLOY_ROLE_ARN -b <DeployRoleArn>; gh secret set AWS_ROLE_ARN -b <GateRoleArn>
 gh secret set AWS_RELEASE_ROLE_ARN -b <ReleaseRoleArn>
 gh variable set AWS_REGION -b <region>; gh variable set AGENT_RUNTIME_ARN -b <runtime-arn>
 # Settings -> Environments -> production -> Required reviewers (私有仓库需要 GitHub Team / Enterprise)
 mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows/agent-eval.yml
 ```
+
+### 安全扫描: Amazon Inspector (依赖, CI 里) 与 AWS Continuum (代码, 发布前)
+
+```bash
+# Amazon Inspector: SBOM (inspector-sbomgen, 仅 Linux) -> ScanSbom -> 有 HIGH 及以上即 exit 1
+# CI 里是部署步骤的第一步 (buildspec-deploy.yml / github-actions.yml pr 作业), 有漏洞就什么都不部署
+SECURITY_FAIL_ON=HIGH bash release/ci/security_scan.sh           # -> out/security-report.json; macOS 上请在 CI 或 Linux 容器里跑
+
+# AWS Continuum: 代码 zip + 业务上下文放进 S3, 验证漏洞是否可利用, 确认的漏洞变成 issue 并生成补丁
+$PYTHON release/security/continuum_scan.py setup                 # 栈 evaldeck-continuum + 集成 + 环境 (只手动扫描), 并开始第一次扫描
+$PYTHON release/security/continuum_scan.py wait                  # 等这次扫描结束 (构建 + 扫描, 约 10-30 分钟)
+$PYTHON release/security/continuum_scan.py results               # findings / issues / 补丁 -> out/continuum/
+$PYTHON release/security/continuum_scan.py upload && $PYTHON release/security/continuum_scan.py scan   # 代码改了之后再扫
+```
+Continuum 按代码行数收月度 context 费, 按推理单元收每次安全工作的费用 (见 AWS Continuum 定价页); 环境默认每天扫描一次
+(`scanFrequency` P1D), 脚本建环境时设成 `PT0H` (只手动扫描)。不再使用时删除环境。
 
 ## Step -> files -> what it does -> verified
 
@@ -185,7 +203,9 @@ mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows
 | ③ | `evaluate/run_dataset.py` | `OnDemandEvaluationDatasetRunner` (`--mode ondemand`) or `BatchEvaluationRunner` / `StartBatchEvaluation` (`--mode batch`, incl. `Builtin.FailureAnalysis`) over a pinned Dataset version | ✅ ran on 2026-11-06 (both modes) |
 | ③ | `evaluate/simulate.py` | user simulation: `SimulationConfig` + `ActorProfile` personas, scored like any session | ✅ ran on 2026-11-06 (2 personas) |
 | ② | `agent/evaldeck/agentcore/agentcore.json` | named endpoints `STAGING` + `PROD` (DEFAULT follows latest); Gateway targets `shop` -> PROD, `shopStaging` -> STAGING; agent spans carry `evaldeck.prompt_source` + bundle version | ✅ v2: deployed (PROD imported into the stack, STAGING created, runtime v4) |
-| ④ Release | `release/deploy_staging.sh` | endpoint pins = the deployed template's pins -> `agentcore deploy` -> STAGING -> newest version -> PROD-unchanged check -> `out/staging.json` {runtimeVersion, bundleVersion, datasetVersion, gitCommit, gate_key} | ✅ v2: ran locally (STAGING 1 -> 4) and in CodeBuild (runtime v5); v3: own DeployStaging stage (runtime v8, STAGING 5 -> 8, PROD stayed 5) |
+| ④ Release | `release/ci/security_scan.sh` | Amazon Inspector SBOM Generator (checksum-verified download) inventories requirements.txt, the runtime's uv.lock and the CDK package-lock.json -> `inspector-scan ScanSbom` -> `out/security-report.json`; finding >= `SECURITY_FAIL_ON` (HIGH) -> exit 1; first command of the deploy step in both CI systems | ✅ 2026-11-08: first run found 2 HIGH + 4 MEDIUM (brace-expansion 5.0.9 bundled in aws-cdk-lib 2.269, OpenTelemetry 1.44) -> BLOCKED; fixed by aws-cdk-lib ~2.275 + aws-cdk ~2.1148 + aws-opentelemetry-distro ~0.22 -> 133 components, 0 findings, PASS in CodeBuild DeployStaging; runtime v6 with the new packages passed the gate and was released |
+| ④ | `release/security/continuum.yaml`, `continuum_scan.py` | AWS Continuum for code vulnerabilities on an S3 code source: bucket (versioned, TLS-only) + integration role (`/continuum/integrations/`, external ID); integration + environment (manual scans, patches on, build domains pypi / npm); scan, findings, issues, PATCH artifacts -> `out/continuum/` | see "Things the run taught" |
+| ④ | `release/deploy_staging.sh` | endpoint pins = the deployed template's pins -> `agentcore deploy` -> STAGING -> newest version -> PROD-unchanged check -> `out/staging.json` {runtimeVersion, bundleVersion, datasetVersion, gitCommit, gate_key} | ✅ v2: ran locally (STAGING 1 -> 4) and in CodeBuild (runtime v5); v3: own DeployStaging stage (runtime v8, STAGING 5 -> 8, PROD stayed 5) |
 | ④ | `release/protect_prod.sh` | one-time: CloudFormation stack policy denying every update of the PROD `RuntimeEndpoint` resource + termination protection on the agent stack | ✅ v3: applied; a deploy that changed the PROD pin failed with "Action denied by stack policy" and rolled back, PROD stayed 5 |
 | ④ | `release/gate_key.py`, `test_gate_key.py` | gate_key = sha256(commit, runtimeVersion, bundleVersion, datasetVersion, sha256(gate.yaml)); `--staging --check` recomputes | ✅ v2: unit tests; release refused a tampered staging.json |
 | ④ | `release/gate.py`, `release/baseline.json`, `release/waivers.yaml`, `test_gate.py` | PASS / BLOCKED per segment (`acceptance` = run_dataset, `sim` = simulate): thresholds, red line = 0, no regression (`max(tol, step/n)`), baseline per segment + dataset version, missing results / unverified bundle = blocked; waivers (gate metric only, floor, expiry, approver; red line refused) | ✅ v2: STAGING gate PASS (bundle verified 8/8 sessions); waiver applied + red-line waiver refused; 27 release unit tests |
@@ -227,8 +247,42 @@ mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows
    DEFAULT denied; A/B ship drill; 90/10 canary rule; Policy LOG_ONLY -> ENFORCE; the same path once more through
    CodePipeline (S3 source -> Gate in CodeBuild: deploy runtime v5 + gate PASS -> CLI approval -> Release PROD 4 -> 5; two IAM / YAML fixes on the way).
 
+## Security model (what the gate proves, and what protects the gate)
+
+The kit was scanned with Amazon Inspector (dependencies) and AWS Continuum (code) on 2026-11-08; the fixes are in the
+code, and this is the trust model the scripts assume:
+
+- **The gate's code ships in the commit it judges.** `gate_step.sh`, `gate.py`, `record.py` and the evaluators run
+  from the candidate, so a change to them can change what PASS means. `gate_key` includes a hash of that code, the
+  GitHub workflow writes gate records only from `main`, and the release reads only records for the key it recomputes.
+  That is not enough on its own: protect `release/`, `define/`, `evaluate/`, `common/` and the workflow with
+  CODEOWNERS + branch protection (`release/ci/CODEOWNERS.example`), and release only from the protected branch
+  (CodePipeline: the CodeConnections source on `main`; S3 source = whoever can upload).
+- **CI identities.** The pr job runs in the GitHub environment `staging`, the release job in `production`; each OIDC
+  role trusts one environment, with the numeric owner / repository ids pinned (`github-oidc-roles.yaml`). The deploy
+  role can use the CDK bootstrap roles, so give `staging` required reviewers if pull requests come from people who
+  should not deploy. Fork pull requests get no OIDC token.
+- **What a PASS is bound to.** `gate.py` blocks unless every results file comes from the staging run in
+  `out/staging.json` (endpoint, runtime ARN, dataset id + version, bundle version, created after the deployment) and
+  every scenario / persona was scored; `release.sh` releases only what the PASS record (written by the gate role) names.
+- **Red line.** `evaldeck_RedlineCode` fails closed (a rule that cannot run is an evaluator error, never COMPLIANT) and
+  normalizes Unicode digits and separators before the card-number check; keep an LLM judge next to it.
+- **Agent.** One conversation per runtime session id (AgentCore Runtime runs each session in its own microVM); only
+  the new user turn is accepted, history is a bounded sliding window. Callers are IAM-authorized backends; add the
+  end-user identity to the session key before one session serves several users.
+- **Rollback.** The Lambda acts only on a verified CloudWatch alarm event from this account / Region whose alarm is in
+  ALARM when re-read (DescribeAlarms); it cannot touch STAGING or DEFAULT.
+- **Supply chain.** CI installs Python packages from a hash-pinned lock (`release/ci/requirements.lock`, regenerate
+  with the command in `requirements-ci.in`), actions are pinned to commit SHAs, Inspector scans every deploy.
+
 ## Things the run taught (also in the script headers)
 
+- Continuum (2026-11-08) on this kit: 20 findings in one scan (2 CRITICAL, 9 HIGH), 16 confirmed exploitable within
+  minutes of the scan; all are fixed or covered by the security model above (OIDC trust, session isolation, caller
+  history, gate evidence binding, red-line evasion, rollback trigger verification, least privilege, pinned installs).
+- Inspector (2026-11-08): the template's pinned CDK and OpenTelemetry versions carried 2 HIGH CVEs; upgrading aws-cdk-lib
+  also needs a matching CDK CLI (`aws-cdk` ~2.1148 reads cloud assembly schema 55), otherwise synth fails in CI.
+- Continuum (2026-11-08): CreateEnvironment without `scanFrequency` schedules a scan every day (P1D); `PT0H` = manual only.
 - Security review (2026-11-08): checkov CKV_AWS_18 / 21 on the pipeline buckets. Artifact and source buckets log into a
   dedicated access-log bucket and are versioned; that bucket cannot log into itself (AWS: endless loop), so it logs to an
   optional `CentralAccessLogBucket` (an existing org log bucket) and has no access logging when the parameter is empty.
@@ -284,11 +338,13 @@ endpoint with `release/protect_prod.sh`; in production put STAGING and PROD in s
 | Step / script | Needs |
 |---|---|
 | ③ send_traffic / run_dataset / simulate (caller = CI gate role) | `bedrock-agentcore:InvokeAgentRuntime` (STAGING), `Evaluate`, `ListEvaluators`, `GetEvaluator`, `GetDataset`, `ListDatasetExamples`, `ListDatasetVersions`, `GetConfigurationBundleVersion`; **logs:StartQuery / GetQueryResults / FilterLogEvents** on `/aws/bedrock-agentcore/runtimes/*` and `aws/spans` (span collector, ingestion guard, bundle_check); `bedrock:InvokeModel` (custom / derived judges and the simulated user run on the caller's credentials); `lambda:InvokeFunction` + `GetFunction` on the CustomCode evaluator |
+| ④ security_scan.sh (DeployRole) | `inspector-scan:ScanSbom` (no Inspector activation needed) |
+| ④ continuum_scan.py (operator) | `continuum:*Integration*`, `*Environment*`, `CreateCodeScan` / `GetCodeScan` / `ListCodeScans`, `ListCodeFindings`, `ListCodeIssues` / `GetCodeIssue`, `ListCodeIssueArtifacts` / `GetCodeIssueArtifact`; `iam:PassRole` on the integration role with `iam:PassedToService` = `continuum.amazonaws.com`; `s3:PutObject` on the code bucket; CloudFormation for `continuum.yaml` |
 | ④ deploy_staging.sh (DeployRole) | CDK deploy = `sts:AssumeRole` on `cdk-hnb659fds-*`; the CLI itself reads `cloudformation:DescribeStacks` on the project stack **and `CDKToolkit`** (+ `GetTemplate` for the pin sync), `ssm:GetParameter /cdk-bootstrap/*`, Transaction Search read (`xray:GetTraceSegmentDestination`, `GetIndexingRules`, `logs:DescribeResourcePolicies`); `ListAgentRuntimeVersions`, `ListAgentRuntimeEndpoints`, `GetAgentRuntimeEndpoint`, `UpdateAgentRuntimeEndpoint` (STAGING only; PROD / DEFAULT denied) |
 | ④ protect_prod.sh (platform admin, once) | `cloudformation:GetTemplate`, `SetStackPolicy`, `UpdateTerminationProtection` on the agent stack |
 | ④ record.py | `ssm:PutParameter`, `ssm:AddTagsToResource` on `parameter/<prefix>/gate/*` |
 | ④ release.sh | **`ssm:GetParameter`** on `parameter/<prefix>/*`, **`ssm:PutParameter` / `AddTagsToResource`** on `parameter/<prefix>/release/*`; `GetAgentRuntimeEndpoint`, `UpdateAgentRuntimeEndpoint` (PROD); `ListGatewayRules`, `CreateGatewayRule`, `UpdateGatewayRule`; in CodePipeline `codepipeline:ListActionExecutions` (who approved) |
-| ④ rollback_lambda.py | `UpdateAgentRuntimeEndpoint` (PROD), `ListGatewayRules` / `UpdateGatewayRule` (if GATEWAY_ID), `GetABTest` / `UpdateABTest` (if AB_TEST_ID), `ssm:GetParameter` / `PutParameter` on `parameter/<prefix>/release/*` |
+| ④ rollback_lambda.py | `UpdateAgentRuntimeEndpoint` (PROD; STAGING / DEFAULT denied), `ListGatewayRules` / `UpdateGatewayRule` (if GATEWAY_ID), `GetABTest` / `UpdateABTest` (if AB_TEST_ID), `ssm:GetParameter` / `PutParameter` on `parameter/<prefix>/release/*`, `cloudwatch:DescribeAlarms` on `alarm:<prefix>-*` |
 | ④ harden_default.sh | `GetResourcePolicy`, `PutResourcePolicy` on `<runtime-arn>/runtime-endpoint/DEFAULT`, `ListAgentRuntimeEndpoints` |
 | ④ ab_ship.sh | `GetABTest`, `ListGatewayRules`, `CreateGatewayRule`, `UpdateGatewayRule`; `ssm:GetParameter` (restore) |
 | ④ policy.sh | `CreatePolicyEngine`, `GetPolicyEngine`, `ListPolicyEngines`, `CreatePolicy`, `ListPolicies`, `GetGateway`, `UpdateGateway`, `iam:PassRole` on the Gateway role, `iam:PutRolePolicy` (grants the Gateway role `GetPolicyEngine`, `CheckAuthorizePermissions`, `AuthorizeAction`, `PartiallyAuthorizeActions` on engine + gateway), `cloudwatch:ListMetrics` / `GetMetricData` |

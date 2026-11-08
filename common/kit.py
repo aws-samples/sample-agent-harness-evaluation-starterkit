@@ -169,8 +169,9 @@ def bundle_check(session_ids: list[str], arn: str | None = None, hours: int = 3)
 
 
 def gateway_id(name: str | None = None) -> str:
-    """Deployed Gateway id: GATEWAY_ID, else `agentcore status`, else ListGateways by the CLI's naming
-    (<project>-<target>-<gatewayname lowercased>)."""
+    """Deployed Gateway id: GATEWAY_ID, else `agentcore status`, else ListGateways by the CLI's exact naming
+    <project>-<target>-<gatewayname> for the targets in agentcore/aws-targets.json. Exactly one match or an error:
+    release automation (ship rule, Cedar policy) must never act on a gateway picked by a fuzzy match."""
     if os.getenv("GATEWAY_ID"):
         return os.environ["GATEWAY_ID"]
     name = name or os.getenv("GATEWAY_NAME", "evaldeckFront")
@@ -180,12 +181,21 @@ def gateway_id(name: str | None = None) -> str:
         for r in json.loads(out).get("resources", []):
             if r.get("resourceType") == "gateway" and r.get("name") == name and r.get("arn"):
                 return r["arn"].rsplit("/", 1)[1]
-    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError):
-        pass
-    for g in client("bedrock-agentcore-control").list_gateways().get("items", []):
-        if g["name"].endswith(f"-{name.lower()}") and g["name"].startswith(PREFIX):
-            return g["gatewayId"]
-    raise SystemExit(f"gateway {name} not found: set GATEWAY_ID")
+    except (subprocess.CalledProcessError, FileNotFoundError, json.JSONDecodeError) as e:
+        print(f"agentcore status failed ({type(e).__name__}); looking the gateway up by its exact name", flush=True)
+    targets_file = PROJECT_DIR / "agentcore" / "aws-targets.json"
+    targets = [t["name"] for t in json.loads(targets_file.read_text())] if targets_file.exists() else ["default"]
+    wanted = {f"{PREFIX}-{t}-{name}".lower() for t in targets}
+    hits, token = [], None
+    while True:
+        r = client("bedrock-agentcore-control").list_gateways(**({"nextToken": token} if token else {}))
+        hits += [g for g in r.get("items", []) if g["name"].lower() in wanted]
+        token = r.get("nextToken")
+        if not token:
+            break
+    if len(hits) != 1:
+        raise SystemExit(f"gateway {name}: {len(hits)} gateways named {sorted(wanted)}; set GATEWAY_ID")
+    return hits[0]["gatewayId"]
 
 
 def account_id() -> str:

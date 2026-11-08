@@ -4,13 +4,15 @@ import json
 
 import gate_key as gk
 
-DOC = {"gitCommit": "abc123", "runtimeVersion": "4", "bundleVersion": "649aeb81", "datasetVersion": "4"}
+DOC = {"gitCommit": "abc123", "runtimeId": "rt-a", "runtimeVersion": "4", "bundleArn": "arn:b/1",
+       "bundleVersion": "649aeb81", "datasetId": "ds-1", "datasetVersion": "4"}
 
 
 def test_key_changes_with_every_input():
     base = gk.from_staging(DOC)
     assert base == gk.from_staging(dict(DOC)) and len(base) == 16
-    for k, v in (("gitCommit", "abc124"), ("runtimeVersion", "5"), ("bundleVersion", None), ("datasetVersion", "3")):
+    for k, v in (("gitCommit", "abc124"), ("runtimeVersion", "5"), ("bundleVersion", None), ("datasetVersion", "3"),
+                 ("runtimeId", "rt-b"), ("bundleArn", "arn:b/2"), ("datasetId", "ds-2")):
         assert gk.from_staging({**DOC, k: v}) != base, k
 
 

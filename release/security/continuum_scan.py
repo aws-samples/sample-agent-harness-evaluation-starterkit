@@ -120,8 +120,10 @@ def setup() -> dict:
     if not env:
         env = ctm().create_environment(name=NAME, configuration={"codeConfiguration": {
             "sourceConfiguration": {"s3Sources": [{"integrationId": integ, "codePrefix": "code/", "contextPrefix": "context/"}]},
-            "environmentConfiguration": {"patchCreationPolicy": "ENABLED", "network": {"allowedDomains": ALLOWED_DOMAINS}}}}
-        )["environmentId"]                                   # no scanFrequency: manual scans only
+            # scanFrequency defaults to P1D (a scan every day); PT0H = manual scans only
+            "environmentConfiguration": {"scanFrequency": "PT0H", "patchCreationPolicy": "ENABLED",
+                                         "network": {"allowedDomains": ALLOWED_DOMAINS}}}}
+        )["environmentId"]
     e = ctm().get_environment(environmentId=env)
     info = {"integrationId": integ, "environmentId": env, "status": e.get("status"),
             "codeConfiguration": (e.get("configuration") or {}).get("codeConfiguration")}

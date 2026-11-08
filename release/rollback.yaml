@@ -24,6 +24,10 @@ Parameters:
     Type: String
     Default: ""
     Description: running A/B test to pause instead of rolling back (empty = none)
+  AllowedAlarms:
+    Type: String
+    Default: ""
+    Description: comma-separated alarm names that may roll back (empty = any <prefix>-<agent>-redline / -goal-score alarm)
   DryRun:
     Type: String
     Default: "true"
@@ -73,6 +77,16 @@ Resources:
                 Effect: Allow
                 Action: [bedrock-agentcore:GetAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint]
                 Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/${EndpointName}"]
+              - Sid: VerifyAlarmState                  # the handler re-reads the alarm before acting
+                Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${NamePrefix}-*"
+              - Sid: NeverTouchStagingOrDefault
+                Effect: Deny
+                Action: [bedrock-agentcore:UpdateAgentRuntimeEndpoint, bedrock-agentcore:DeleteAgentRuntimeEndpoint]
+                Resource:
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/STAGING"
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/DEFAULT"
               - Sid: ReleaseRecords
                 Effect: Allow
                 Action: [ssm:GetParameter, ssm:PutParameter]
@@ -120,6 +134,8 @@ Resources:
           GATEWAY_ID: !Ref GatewayId
           AB_TEST_ID: !Ref AbTestId
           DRY_RUN: !Ref DryRun
+          EXPECTED_ACCOUNT: !Ref AWS::AccountId
+          ALLOWED_ALARMS: !Ref AllowedAlarms
       Tags: [{Key: project, Value: !Ref NamePrefix}]
   AlarmRule:
     Type: AWS::Events::Rule

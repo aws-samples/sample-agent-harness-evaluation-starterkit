@@ -180,3 +180,28 @@ def test_segment_prefix_on_command_line(tmp_path):
     p = _doc(tmp_path, "s.json", "acceptance")
     segs = g.merge_segments([__import__("pathlib").Path(f"sim={p}")])
     assert list(segs) == ["sim"]
+
+
+def test_unknown_rule_and_gate_tier_violations_fail_closed():
+    spec = {**GATE, "metrics": [{"evaluator": "Builtin.GoalSuccessRate", "tier": "gate", "rule": "median_gte", "threshold": 0.8},
+                                {"evaluator": "evaldeck_RedlineCode", "tier": "gate", "rule": "violations_eq0"}]}
+    r = g.decide(spec, m(), DS, BASE, [])
+    assert r["decision"] == "BLOCKED" and any("unknown rule" in x for x in r["reasons"]), r["reasons"]
+    bad = {"Builtin.GoalSuccessRate": {"values": [1.0], "errors": 0}, "evaldeck_RedlineCode": {"values": [1.0, 0.0], "errors": 0}}
+    spec2 = {**GATE, "metrics": [spec["metrics"][1]]}
+    r = g.decide(spec2, bad, DS, BASE, [])
+    assert r["decision"] == "BLOCKED" and any("1 violation" in x for x in r["reasons"]), r["reasons"]
+
+
+def test_binding_rejects_evidence_from_another_candidate(tmp_path):
+    staging = {"endpoint": "STAGING", "runtimeArn": "arn:rt/a", "runtimeId": "a", "bundleVersion": None,
+               "datasetId": "ds-1", "datasetVersion": "2", "at": "2026-11-08T10:00:00+00:00"}
+    good = {"agent": {"endpoint": "STAGING", "runtime_arn": "arn:rt/a", "bundle": None},
+            "dataset": {"id": "ds-1", "version": "2"}, "created_at": "2026-11-08T10:30:00+00:00"}
+    segs = {"acceptance": {**g._empty(), "docs": [(tmp_path / "ok.json", good)]}}
+    assert g.binding_problems(staging, segs) == []
+    for change in ({"agent": {**good["agent"], "endpoint": "PROD"}}, {"agent": {**good["agent"], "runtime_arn": "arn:rt/b"}},
+                   {"agent": {**good["agent"], "bundle": {"version": "v9"}}}, {"dataset": {"id": "ds-1", "version": "1"}},
+                   {"created_at": "2026-11-08T09:00:00+00:00"}):
+        segs = {"acceptance": {**g._empty(), "docs": [(tmp_path / "bad.json", {**good, **change})]}}
+        assert g.binding_problems(staging, segs), change

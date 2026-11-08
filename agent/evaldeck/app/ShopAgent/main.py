@@ -7,13 +7,18 @@
   BedrockAgentCoreContext.get_config_bundle() returns {} when no bundle is attached.
 - Every invoke_agent span carries the prompt source (evaldeck.prompt_source = bundle | code_default) and
   the bundle ARN / version, so the gate can prove it scored the bundle version that ships.
+- Conversation state: one Agent per runtime session id. AgentCore Runtime runs each session in its own microVM, so
+  the session id is the isolation boundary; a request without one is rejected (no shared fallback session). History
+  is bounded (sliding window), and only the caller's new user turn is accepted (parse.py).
+- Callers are trusted backends authorized with IAM (or the Gateway); end-user identity, if you add one, belongs in
+  the session key as well (for example a Gateway / JWT principal) before you serve several users per session.
 """
 
 from functools import lru_cache
 
 from bedrock_agentcore.runtime import BedrockAgentCoreApp, BedrockAgentCoreContext
 from strands import Agent
-from strands.agent.conversation_manager.null_conversation_manager import NullConversationManager
+from strands.agent.conversation_manager import SlidingWindowConversationManager
 
 from model.load import load_model
 from parse import parse_payload
@@ -43,11 +48,15 @@ def _system_prompt() -> tuple[str, tuple[tuple[str, str], ...]]:
     return DEFAULT_SYSTEM_PROMPT, (("evaldeck.prompt_source", "code_default"),)
 
 
-@lru_cache(maxsize=128)
+HISTORY_MESSAGES = 40     # sliding window kept per session (older turns are dropped)
+
+
+@lru_cache(maxsize=16)      # one microVM serves one runtime session; the cache only bounds repeated calls
 def _get_agent(session_id: str, system_prompt: str, source: tuple[tuple[str, str], ...]) -> Agent:
     # one Agent per session keeps multi-turn history in memory for the life of the runtime session
     return Agent(model=load_model(), system_prompt=system_prompt, tools=TOOLS,
-                 conversation_manager=NullConversationManager(), trace_attributes=dict(source))
+                 conversation_manager=SlidingWindowConversationManager(window_size=HISTORY_MESSAGES),
+                 trace_attributes=dict(source))
 
 
 app = BedrockAgentCoreApp()
@@ -55,8 +64,10 @@ app = BedrockAgentCoreApp()
 
 @app.entrypoint
 async def invoke(payload, context):
-    session_id = getattr(context, "session_id", None) or "default-session"
-    prompt, _actor = parse_payload(payload)
+    session_id = getattr(context, "session_id", None)
+    if not session_id:
+        raise ValueError("a runtime session id is required (X-Amzn-Bedrock-AgentCore-Runtime-Session-Id)")
+    prompt = parse_payload(payload)
     agent = _get_agent(session_id, *_system_prompt())
     result = await agent.invoke_async(prompt)
     return {"response": str(result).strip()}

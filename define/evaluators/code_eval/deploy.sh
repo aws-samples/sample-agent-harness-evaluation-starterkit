@@ -27,15 +27,22 @@ if ! ROLE_ARN=$(aws iam get-role --role-name "$ROLE" --query Role.Arn --output t
   sleep 10   # IAM propagation before Lambda can assume the new role
 fi
 
-rm -f /tmp/${FN}.zip && zip -q -j /tmp/${FN}.zip handler.py
+TMPD=$(mktemp -d)                      # private directory (0700): nobody can swap the package between zip and upload
+trap 'rm -rf "$TMPD"' EXIT
+ZIP="$TMPD/${FN}.zip"
+zip -q -j -X "$ZIP" handler.py
 if aws lambda get-function --function-name "$FN" --region "$REGION" >/dev/null 2>&1; then
-  aws lambda update-function-code --function-name "$FN" --zip-file fileb:///tmp/${FN}.zip --region "$REGION" >/dev/null
+  aws lambda update-function-code --function-name "$FN" --zip-file "fileb://$ZIP" --region "$REGION" >/dev/null
 else
   aws lambda create-function --function-name "$FN" --runtime python3.13 --handler handler.handler \
-    --role "$ROLE_ARN" --zip-file fileb:///tmp/${FN}.zip --timeout 60 --memory-size 256 \
+    --role "$ROLE_ARN" --zip-file "fileb://$ZIP" --timeout 60 --memory-size 256 \
     --tags project="$PREFIX" --region "$REGION" >/dev/null
 fi
 aws lambda wait function-updated-v2 --function-name "$FN" --region "$REGION"
+# the deployed code must be the package built here
+LOCAL_SHA=$(openssl dgst -sha256 -binary "$ZIP" | openssl base64 -A)
+REMOTE_SHA=$(aws lambda get-function-configuration --function-name "$FN" --region "$REGION" --query CodeSha256 --output text)
+[ "$LOCAL_SHA" = "$REMOTE_SHA" ] || { echo "deployed CodeSha256 $REMOTE_SHA != local package $LOCAL_SHA" >&2; exit 1; }
 FN_ARN=$(aws lambda get-function --function-name "$FN" --region "$REGION" --query Configuration.FunctionArn --output text)
 
 # register once; later runs only update the Lambda code (the evaluator just points at the ARN)

@@ -4,13 +4,19 @@
 #   deploy   pr job, step "Deploy candidate to STAGING": CDK deploy via the bootstrap roles, STAGING only
 #   gate     pr job, gate + record: invoke / evaluate / read spans, write /<prefix>/gate/*; no deploy, no endpoints
 #   release  release job, only from the GitHub environment `production` (its required reviewers = the approval)
+# Trust: every role trusts exactly one GitHub environment, never a bare pull_request or branch context. The pr job runs
+# in environment `staging` (StagingEnvironment): give it required reviewers (or deployment branch rules) so code from
+# an unreviewed pull request cannot obtain the deploy role, which can use the CDK bootstrap roles. The release job
+# runs in `production`. Pin the numeric owner / repository ids (GitHubOwnerId, GitHubRepositoryId) so a renamed or
+# re-created repository with the same name cannot assume the roles.
 # Deploy (once per account and repository):
 #   aws cloudformation deploy --stack-name evaldeck-github-oidc --template-file release/ci/github-oidc-roles.yaml \
 #     --capabilities CAPABILITY_IAM --parameter-overrides GitHubRepository=<org>/<repo> AgentRuntimeArn=<arn>
 #     [ExistingOidcProviderArn=<arn>]    # an account has at most one provider for token.actions.githubusercontent.com
 # Subject claim: repositories created since GitHub's immutable-subject change send
-#   repo:<owner>@<owner-id>/<repo>@<repo-id>:<context>   (GET /repos/<owner>/<repo>/actions/oidc/customization/sub)
-# instead of repo:<owner>/<repo>:<context>; the trust policies accept both.
+#   repo:<owner>@<owner-id>/<repo>@<repo-id>:environment:<env>   (GET /repos/<owner>/<repo>/actions/oidc/customization/sub)
+# Set GitHubOwnerId + GitHubRepositoryId for those (the ids are pinned exactly); leave them empty for a repository
+# that still sends repo:<owner>/<repo>:environment:<env>.
 # Then set the repository secrets AWS_DEPLOY_ROLE_ARN / AWS_ROLE_ARN / AWS_RELEASE_ROLE_ARN from the stack outputs.
 AWSTemplateFormatVersion: "2010-09-09"
 Description: evaldeck - GitHub Actions OIDC roles for the agent evaluation gate and release workflow
@@ -23,9 +29,24 @@ Parameters:
     Type: String
     AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
     Description: owner/repository that runs release/ci/github-actions.yml
-  MainBranch:
+  GitHubOwnerId:
     Type: String
-    Default: main
+    Default: ""
+    AllowedPattern: "^[0-9]*$"
+    Description: numeric owner id from the immutable subject (empty = legacy subject repo:<owner>/<repo>)
+  GitHubRepositoryId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^[0-9]*$"
+    Description: numeric repository id from the immutable subject
+  StagingEnvironment:
+    Type: String
+    Default: staging
+    Description: GitHub environment of the pr job (deploy + gate roles); add required reviewers to it
+  GatewayId:
+    Type: String
+    Default: ""
+    Description: front-door gateway whose ship rule release.sh may pin (empty = no gateway-rule permissions)
   AgentRuntimeArn:
     Type: String
     AllowedPattern: "^arn:aws[a-z-]*:bedrock-agentcore:[a-z0-9-]+:[0-9]{12}:runtime/[a-zA-Z0-9_-]+$"
@@ -35,6 +56,8 @@ Parameters:
     Description: ARN of an existing token.actions.githubusercontent.com provider (empty = create one)
 Conditions:
   CreateProvider: !Equals [!Ref ExistingOidcProviderArn, ""]
+  ImmutableSubject: !And [!Not [!Equals [!Ref GitHubOwnerId, ""]], !Not [!Equals [!Ref GitHubRepositoryId, ""]]]
+  HasGateway: !Not [!Equals [!Ref GatewayId, ""]]
 Resources:
   GitHubOidcProvider:
     Type: AWS::IAM::OIDCProvider
@@ -57,13 +80,14 @@ Resources:
               Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
-              StringEquals: {"token.actions.githubusercontent.com:aud": sts.amazonaws.com}
-              StringLike:
-                "token.actions.githubusercontent.com:sub":
-                  - !Sub "repo:${GitHubRepository}:pull_request"
-                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/${MainBranch}"
-                  - !Sub ["repo:${Owner}@*/${Repo}@*:pull_request", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
-                  - !Sub ["repo:${Owner}@*/${Repo}@*:ref:refs/heads/${MainBranch}", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !If
+                  - ImmutableSubject
+                  - !Sub
+                    - "repo:${Owner}@${GitHubOwnerId}/${Repo}@${GitHubRepositoryId}:environment:${StagingEnvironment}"
+                    - {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}
+                  - !Sub "repo:${GitHubRepository}:environment:${StagingEnvironment}"
       Tags: [{Key: project, Value: !Ref NamePrefix}]
       Policies:
         - PolicyName: deploy-staging
@@ -127,13 +151,14 @@ Resources:
               Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
-              StringEquals: {"token.actions.githubusercontent.com:aud": sts.amazonaws.com}
-              StringLike:
-                "token.actions.githubusercontent.com:sub":
-                  - !Sub "repo:${GitHubRepository}:pull_request"
-                  - !Sub "repo:${GitHubRepository}:ref:refs/heads/${MainBranch}"
-                  - !Sub ["repo:${Owner}@*/${Repo}@*:pull_request", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
-                  - !Sub ["repo:${Owner}@*/${Repo}@*:ref:refs/heads/${MainBranch}", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !If
+                  - ImmutableSubject
+                  - !Sub
+                    - "repo:${Owner}@${GitHubOwnerId}/${Repo}@${GitHubRepositoryId}:environment:${StagingEnvironment}"
+                    - {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}
+                  - !Sub "repo:${GitHubRepository}:environment:${StagingEnvironment}"
       Tags: [{Key: project, Value: !Ref NamePrefix}]
       Policies:
         - PolicyName: gate
@@ -209,11 +234,14 @@ Resources:
               Federated: !If [CreateProvider, !Ref GitHubOidcProvider, !Ref ExistingOidcProviderArn]
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
-              StringEquals: {"token.actions.githubusercontent.com:aud": sts.amazonaws.com}
-              StringLike:
-                "token.actions.githubusercontent.com:sub":
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": sts.amazonaws.com
+                "token.actions.githubusercontent.com:sub": !If
+                  - ImmutableSubject
+                  - !Sub
+                    - "repo:${Owner}@${GitHubOwnerId}/${Repo}@${GitHubRepositoryId}:environment:production"
+                    - {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}
                   - !Sub "repo:${GitHubRepository}:environment:production"
-                  - !Sub ["repo:${Owner}@*/${Repo}@*:environment:production", {Owner: !Select [0, !Split ["/", !Ref GitHubRepository]], Repo: !Select [1, !Split ["/", !Ref GitHubRepository]]}]
       Tags: [{Key: project, Value: !Ref NamePrefix}]
       Policies:
         - PolicyName: release
@@ -223,7 +251,9 @@ Resources:
               - Sid: ReadGateRecordWriteReleaseRecord
                 Effect: Allow
                 Action: ssm:GetParameter
-                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/gate/*"
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
               - Effect: Allow
                 Action: [ssm:PutParameter, ssm:AddTagsToResource]
                 Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${NamePrefix}/release/*"
@@ -231,10 +261,19 @@ Resources:
                 Effect: Allow
                 Action: [bedrock-agentcore:GetAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint]
                 Resource: [!Ref AgentRuntimeArn, !Sub "${AgentRuntimeArn}/runtime-endpoint/PROD"]
-              - Sid: PinBundleOnGateway
-                Effect: Allow
-                Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:CreateGatewayRule, bedrock-agentcore:UpdateGatewayRule]
-                Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+              - !If
+                - HasGateway
+                - Sid: PinBundleOnGateway              # only the front door this pipeline releases through
+                  Effect: Allow
+                  Action: [bedrock-agentcore:ListGatewayRules, bedrock-agentcore:CreateGatewayRule, bedrock-agentcore:UpdateGatewayRule]
+                  Resource: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/${GatewayId}"
+                - !Ref AWS::NoValue
+              - Sid: NeverTouchStagingOrDefault          # the runtime ARN above is required for the call, so deny the rest
+                Effect: Deny
+                Action: [bedrock-agentcore:UpdateAgentRuntimeEndpoint, bedrock-agentcore:DeleteAgentRuntimeEndpoint]
+                Resource:
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/STAGING"
+                  - !Sub "${AgentRuntimeArn}/runtime-endpoint/DEFAULT"
 Outputs:
   DeployRoleArn:
     Description: repository secret AWS_DEPLOY_ROLE_ARN

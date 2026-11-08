@@ -13,7 +13,7 @@ phases:
     runtime-versions:
       python: 3.12
     commands:
-      - pip install -q boto3 pyyaml
+      - pip install -q --require-hashes -r release/ci/requirements.lock
   build:
     commands:
       - mkdir -p out && cp "$CODEBUILD_SRC_DIR_GateOutput/staging.json" "$CODEBUILD_SRC_DIR_GateOutput/gate-report.json" out/
