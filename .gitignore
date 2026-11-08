@@ -13,3 +13,6 @@ agent/evaldeck/agentcore/.env.local
 # run outputs (results, reports, job dumps) - regenerate by running the scripts
 out/
 *.zip
+
+# macOS
+.DS_Store
