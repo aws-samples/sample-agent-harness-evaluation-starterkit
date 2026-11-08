@@ -16,7 +16,10 @@ unit): run it on a schedule or before a release, and review its patches like any
            -> out/continuum/<issue-id>.patch, summary -> out/continuum/report.json. Exit 1 when a CONFIRMED issue is at
            or above --fail-on (default: report only).
 Cost: a monthly context fee by protected lines of code plus inference units for the security work (see the AWS
-Continuum pricing page). The environment has no schedule; delete it when you stop using it.
+Continuum pricing page). One scan of this kit produced 20 findings, and validating them is billed per finding.
+OFF BY DEFAULT: `setup` and `scan` (the commands that start billed work) refuse to run unless CONTINUUM_ENABLED=1 is
+set or --enable is passed; nothing in CI calls this script. The environment has no schedule (scanFrequency PT0H);
+delete it when you stop using it (`delete`).
 
 Prerequisites: boto3 with the `continuum` client, AWS CLI v2 (CloudFormation deploy), git.
 IAM (caller): continuum:CreateIntegration/GetIntegration/ListIntegrations/CreateEnvironment/GetEnvironment/
@@ -27,12 +30,15 @@ Usage:
   python release/security/continuum_scan.py setup
   python release/security/continuum_scan.py upload && python release/security/continuum_scan.py scan
   python release/security/continuum_scan.py results [--fail-on HIGH]
+  python release/security/continuum_scan.py delete          # stop all Continuum work and charges for this kit
+Opt in: CONTINUUM_ENABLED=1 python release/security/continuum_scan.py setup   (or --enable)
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -212,13 +218,34 @@ def results(fail_on: str | None) -> int:
     return 1 if blocking else 0
 
 
+def delete() -> None:
+    env = find(ctm().list_environments, "environmentId", NAME)
+    if env:
+        ctm().delete_environment(environmentId=env)
+        print(json.dumps({"deleted_environment": env, "note": "integration and S3 stack kept (no charges); "
+                          f"remove them with delete-integration and `aws cloudformation delete-stack --stack-name {STACK}`"}))
+    else:
+        print(json.dumps({"deleted_environment": None, "note": f"no environment named {NAME}"}))
+
+
+BILLED = {"setup", "scan"}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["setup", "upload", "scan", "wait", "results"])
+    ap.add_argument("cmd", choices=["setup", "upload", "scan", "wait", "results", "delete"])
     ap.add_argument("--fail-on", choices=SEVERITY)
     ap.add_argument("--timeout-min", type=int, default=120)
+    ap.add_argument("--enable", action="store_true", help="opt in to billed Continuum work (same as CONTINUUM_ENABLED=1)")
     a = ap.parse_args()
-    if a.cmd == "setup":
+    if a.cmd in BILLED and not (a.enable or os.getenv("CONTINUUM_ENABLED") == "1"):
+        print("AWS Continuum is off by default: `setup` / `scan` start billed work (context fee + inference units per "
+              "finding; see the AWS Continuum pricing page). Opt in with CONTINUUM_ENABLED=1 or --enable.",
+              file=sys.stderr)
+        return 2
+    if a.cmd == "delete":
+        delete()
+    elif a.cmd == "setup":
         setup()
     elif a.cmd == "upload":
         st = stack_outputs() or sys.exit("run `setup` first")

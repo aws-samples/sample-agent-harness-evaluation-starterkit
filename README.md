@@ -177,13 +177,16 @@ mkdir -p .github/workflows && cp release/ci/github-actions.yml .github/workflows
 # CI 里是部署步骤的第一步 (buildspec-deploy.yml / github-actions.yml pr 作业), 有漏洞就什么都不部署
 SECURITY_FAIL_ON=HIGH bash release/ci/security_scan.sh           # -> out/security-report.json; macOS 上请在 CI 或 Linux 容器里跑
 
-# AWS Continuum: 代码 zip + 业务上下文放进 S3, 验证漏洞是否可利用, 确认的漏洞变成 issue 并生成补丁
-$PYTHON release/security/continuum_scan.py setup                 # 栈 evaldeck-continuum + 集成 + 环境 (只手动扫描), 并开始第一次扫描
+# AWS Continuum (可选, 默认不启用; 会产生费用): 代码 zip + 业务上下文放进 S3, 验证漏洞是否可利用, 确认的漏洞变成 issue 并生成补丁
+# setup / scan 需要显式打开: CONTINUUM_ENABLED=1 (或 --enable); CI 里不调用这个脚本
+CONTINUUM_ENABLED=1 $PYTHON release/security/continuum_scan.py setup   # 栈 evaldeck-continuum + 集成 + 环境 (只手动扫描), 并开始第一次扫描
 $PYTHON release/security/continuum_scan.py wait                  # 等这次扫描结束 (构建 + 扫描, 约 10-30 分钟)
 $PYTHON release/security/continuum_scan.py results               # findings / issues / 补丁 -> out/continuum/
-$PYTHON release/security/continuum_scan.py upload && $PYTHON release/security/continuum_scan.py scan   # 代码改了之后再扫
+$PYTHON release/security/continuum_scan.py upload && CONTINUUM_ENABLED=1 $PYTHON release/security/continuum_scan.py scan   # 代码改了之后再扫
+$PYTHON release/security/continuum_scan.py delete                # 删除环境, 停止 Continuum 的工作与计费
 ```
-Continuum 按代码行数收月度 context 费, 按推理单元收每次安全工作的费用 (见 AWS Continuum 定价页); 环境默认每天扫描一次
+Continuum 按代码行数收月度 context 费, 按推理单元收每次安全工作的费用 (见 AWS Continuum 定价页; 这个 kit 一次扫描出了
+20 条 findings, 验证按条计费), 所以默认不启用; 环境默认每天扫描一次
 (`scanFrequency` P1D), 脚本建环境时设成 `PT0H` (只手动扫描)。不再使用时删除环境。
 
 ## Step -> files -> what it does -> verified
@@ -204,7 +207,7 @@ Continuum 按代码行数收月度 context 费, 按推理单元收每次安全�
 | ③ | `evaluate/simulate.py` | user simulation: `SimulationConfig` + `ActorProfile` personas, scored like any session | ✅ ran on 2026-11-06 (2 personas) |
 | ② | `agent/evaldeck/agentcore/agentcore.json` | named endpoints `STAGING` + `PROD` (DEFAULT follows latest); Gateway targets `shop` -> PROD, `shopStaging` -> STAGING; agent spans carry `evaldeck.prompt_source` + bundle version | ✅ v2: deployed (PROD imported into the stack, STAGING created, runtime v4) |
 | ④ Release | `release/ci/security_scan.sh` | Amazon Inspector SBOM Generator (checksum-verified download) inventories requirements.txt, the runtime's uv.lock and the CDK package-lock.json -> `inspector-scan ScanSbom` -> `out/security-report.json`; finding >= `SECURITY_FAIL_ON` (HIGH) -> exit 1; first command of the deploy step in both CI systems | ✅ 2026-11-08: first run found 2 HIGH + 4 MEDIUM (brace-expansion 5.0.9 bundled in aws-cdk-lib 2.269, OpenTelemetry 1.44) -> BLOCKED; fixed by aws-cdk-lib ~2.275 + aws-cdk ~2.1148 + aws-opentelemetry-distro ~0.22 -> 133 components, 0 findings, PASS in CodeBuild DeployStaging; runtime v6 with the new packages passed the gate and was released |
-| ④ | `release/security/continuum.yaml`, `continuum_scan.py` | AWS Continuum for code vulnerabilities on an S3 code source: bucket (versioned, TLS-only) + integration role (`/continuum/integrations/`, external ID); integration + environment (manual scans, patches on, build domains pypi / npm); scan, findings, issues, PATCH artifacts -> `out/continuum/` | see "Things the run taught" |
+| ④ | `release/security/continuum.yaml`, `continuum_scan.py` | Optional, off by default (`CONTINUUM_ENABLED=1` / `--enable` for the billed `setup` / `scan`; `delete` stops it). AWS Continuum for code vulnerabilities on an S3 code source: bucket (versioned, TLS-only) + integration role (`/continuum/integrations/`, external ID); integration + environment (manual scans, patches on, build domains pypi / npm); scan, findings, issues, PATCH artifacts -> `out/continuum/` | see "Things the run taught" |
 | ④ | `release/deploy_staging.sh` | endpoint pins = the deployed template's pins -> `agentcore deploy` -> STAGING -> newest version -> PROD-unchanged check -> `out/staging.json` {runtimeVersion, bundleVersion, datasetVersion, gitCommit, gate_key} | ✅ v2: ran locally (STAGING 1 -> 4) and in CodeBuild (runtime v5); v3: own DeployStaging stage (runtime v8, STAGING 5 -> 8, PROD stayed 5) |
 | ④ | `release/protect_prod.sh` | one-time: CloudFormation stack policy denying every update of the PROD `RuntimeEndpoint` resource + termination protection on the agent stack | ✅ v3: applied; a deploy that changed the PROD pin failed with "Action denied by stack policy" and rolled back, PROD stayed 5 |
 | ④ | `release/gate_key.py`, `test_gate_key.py` | gate_key = sha256(commit, runtimeVersion, bundleVersion, datasetVersion, sha256(gate.yaml)); `--staging --check` recomputes | ✅ v2: unit tests; release refused a tampered staging.json |
